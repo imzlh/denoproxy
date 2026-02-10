@@ -5,6 +5,7 @@ import { MixedProxyServer } from "./server.ts";
 import { Log } from "@cross/log";
 import { parseArgs } from "@std/cli";
 import { getErrMsg } from "../utils/error.ts";
+import { envNumber, envString } from "../utils/env.ts";
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const INITIAL_RECONNECT_DELAY = 1000;
@@ -15,10 +16,10 @@ export default async function main() {
     const args = parseArgs(Deno.args, {
         string: ["remote", "mmdb", "hostname"],
         default: {
-            remote: "ws://localhost:8080",
-            port: 7890,
-            hostname: "127.0.0.1",
-            mmdb: "./Country.mmdb",
+            remote: envString("CONN_PATH", "ws://localhost:8080"),
+            port: envNumber("MIXED_PORT", 7890),
+            hostname: envString("MIXED_HOST", "127.0.0.1"),
+            mmdb: envString("MMDB", "./Country.mmdb"),
         },
     });
 

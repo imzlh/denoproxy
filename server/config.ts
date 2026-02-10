@@ -1,16 +1,16 @@
 import { parseArgs } from "@std/cli";
-
+import { envNumber, envString } from "../utils/env.ts";
 export function loadConfig() {
     const args = parseArgs(Deno.args, {
         string: ["hostname", "log-level", "tls-cert", "tls-key", "connect-path", "webui"],
         default: {
-            port: 8080,
-            hostname: "0.0.0.0",
-            "log-level": "info",
-            "max-connections": 1000,
-            "connection-timeout": 300000, // 5 minutes
-            "connect-path": "/",
-            "webui": Deno.cwd()
+            port: envNumber("PORT", 8080),
+            hostname: envString("HOSTNAME", "127.0.0.1"),
+            "log-level": envString( "LOG_LEVEL", "info"),
+            "max-connections": envNumber("CONN_LIMIT", 100),
+            "connection-timeout": envNumber("CONNECT_TIMEOUT", 300000), // 5 minutes
+            "connect-path": envString("CONN_PATH", "/"),
+            "webui": envString("WEBUI", Deno.cwd())
         },
         alias: {
             p: "port",
