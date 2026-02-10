@@ -1,0 +1,19 @@
+{
+  "tasks": {
+    "dev": "deno run --watch main.ts",
+    "client": "deno run -A client/main.ts",
+    "server": "deno run -A server/main.ts",
+    "build": "deno compile -A --output denoproxy main.ts",
+    "build:server": "deno compile -A --output denoproxy-server main.ts",
+    "build:client": "deno compile -A --output denoproxy-client client/main.ts"
+  },
+  "imports": {
+    "@cross/log": "jsr:@cross/log@^0.10.5",
+    "@hono/hono": "jsr:@hono/hono@^4.11.9",
+    "@std/assert": "jsr:@std/assert@1",
+    "@std/cli": "jsr:@std/cli@^1.0.0",
+    "@josh-hemphill/maxminddb-wasm": "jsr:@josh-hemphill/maxminddb-wasm@^2.1.8",
+    "@std/http": "jsr:@std/http@^1.0.24",
+    "llhttp-wasm": "npm:llhttp-wasm@^1.0.3"
+  }
+}
