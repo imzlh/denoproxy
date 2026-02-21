@@ -1,4 +1,19 @@
 {
+  "name": "denoproxy",
+  "version": "1.0.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./mod.ts",
+    "./client": "./core/client.ts",
+    "./transport": "./core/transport.ts",
+    "./protocol": "./core/protocol.ts",
+    "./codec": "./core/codec.ts",
+    "./protocol/tcp": "./core/protocol/tcp.ts",
+    "./protocol/udp": "./core/protocol/udp.ts",
+    "./protocol/dns": "./core/protocol/dns.ts",
+    "./protocol/http-proxy": "./core/protocol/http-proxy.ts",
+    "./bjson": "./utils/bjson.ts"
+  },
   "tasks": {
     "dev": "deno run --watch main.ts",
     "client": "deno run -A client/main.ts",

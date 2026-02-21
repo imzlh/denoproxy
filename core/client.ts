@@ -5,10 +5,13 @@ import { Log } from "@cross/log";
 import { decode, encode } from "../utils/bjson.ts";
 import { getErrMsg } from "../utils/error.ts";
 
-const DEFAULT_TIMEOUT = 30000; // 30秒默认超时
+const DEFAULT_TIMEOUT = 30000;
+const MAX_QUEUE_SIZE = 1000;
+const MAX_PENDING_REQUESTS = 10000;
+const RESOURCE_ID_MAX = 0xFFFFFFFF;
 const HEARTBEAT_INTERVAL = 30000;
 const HEARTBEAT_TIMEOUT = 60000;
-const MAX_QUEUE_SIZE = 1000; // 最大消息队列大小
+const MAX_BUFFERED_AMOUNT = 1024 * 1024;
 
 type QueuedMessage = {
     type: MessageType;
@@ -20,8 +23,7 @@ type PendingHandler = {
     resolve: (data: Uint8Array) => any;
     reject: (err: Error) => void;
     stream?: ReadableStreamDefaultController<Uint8Array>;
-    timeout?: number;
-    chunked?: boolean
+    createdAt: number;
 };
 
 export default class ProxyClient {
@@ -35,10 +37,15 @@ export default class ProxyClient {
     private heartbeatTimeout?: number;
     private lastHeartbeat = 0;
     private connectionState: 'connecting' | 'connected' | 'disconnected' = 'disconnected';
+    private pendingCleanupInterval?: number;
 
     constructor(private logger: Log) {
         const sendTextFn = this.sendText.bind(this);
         this.commandHandler = new CommandHandler(sendTextFn, logger, false);
+        
+        this.pendingCleanupInterval = setInterval(() => {
+            this.cleanupPendingRequests();
+        }, 30000);
     }
 
     assign(ws: WebSocket) {
@@ -48,8 +55,8 @@ export default class ProxyClient {
         }
 
         this.ws = ws;
-        this.isClosed = false;
-        this.connectionState = 'connecting';
+        this.isClosed = false; // reset on reassign
+        this.connectionState = 'connected';
         ws.binaryType = "arraybuffer";
 
         ws.addEventListener("message", this.onMessage);
@@ -103,12 +110,19 @@ export default class ProxyClient {
     private onClose = () => this.handleDisconnect();
 
     private handleDisconnect() {
-        if (this.isClosed) return;
-        this.isClosed = true;
+        if (this.connectionState === 'disconnected') return;
         this.connectionState = 'disconnected';
+        // NOTE: do NOT set isClosed=true here - that's only for close()
+        // so that assign() can be called again for reconnection
 
-        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-        if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
+        if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = undefined; }
+        if (this.heartbeatTimeout) { clearTimeout(this.heartbeatTimeout); this.heartbeatTimeout = undefined; }
+
+        const queueSize = this.messageQueue.length;
+        if (queueSize > 0) {
+            this.logger.debug(`Cleaning up ${queueSize} queued messages due to disconnect`);
+            this.messageQueue = [];
+        }
 
         const pendingCount = this.pending.size;
         if (pendingCount > 0) {
@@ -116,6 +130,9 @@ export default class ProxyClient {
         }
 
         for (const [id, handler] of this.pending) {
+            try {
+                handler.stream?.error(new Error("Connection closed"));
+            } catch { /* ignore */ }
             handler.reject(new Error("Connection closed"));
         }
         this.pending.clear();
@@ -125,6 +142,7 @@ export default class ProxyClient {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
         const queue = this.messageQueue;
+        // FIX: 清空队列前先检查大小，避免在发送过程中队列被修改
         this.messageQueue = [];
 
         if (queue.length > 0) {
@@ -133,11 +151,25 @@ export default class ProxyClient {
             });
         }
 
+        let sentCount = 0;
+        let failedCount = 0;
+
         for (const msg of queue) {
             try {
+                // FIX: 检查WebSocket是否仍然打开
+                if (this.ws.readyState !== WebSocket.OPEN) {
+                    // 将剩余消息放回队列
+                    this.messageQueue.push(...queue.slice(sentCount + failedCount));
+                    this.logger.warn("WebSocket closed during flush, re-queued messages", {
+                        requeued: this.messageQueue.length
+                    });
+                    break;
+                }
                 const encoded = encodeMessage(msg);
                 this.ws.send(encoded);
+                sentCount++;
             } catch (err) {
+                failedCount++;
                 this.logger.error("Failed to send queued message", {
                     error: getErrMsg(err),
                     type: msg.type,
@@ -152,14 +184,17 @@ export default class ProxyClient {
             throw new Error("WebSocket not connected");
         }
 
-        const id = this.nextId++;
+        if (this.pending.size >= MAX_PENDING_REQUESTS) {
+            throw new Error("Too many pending requests");
+        }
+
+        const id = this.nextResourceId();
         this.logger.debug("Connecting TCP", { id, host, port });
 
         const stream = this.createReadStream(id);
 
         try {
-            // 使用特殊的请求方法，不会覆盖 createReadStream 创建的 handler
-            await this.requestForConnect(id, encode([host, port]), timeout);
+            await this.request(MessageType.TCP_CONNECT, id, encode([host, port]), timeout);
             this.logger.debug("TCP connected", { id, host, port });
             return new TCPStream(id, this.send.bind(this), stream);
         } catch (err) {
@@ -168,15 +203,28 @@ export default class ProxyClient {
         }
     }
 
+    private nextResourceId(): number {
+        const id = this.nextId++;
+        if (this.nextId >= RESOURCE_ID_MAX) {
+            this.nextId = 1;
+            this.logger.debug("Resource ID wrapped around");
+        }
+        return id;
+    }
+
     async queryDNS(name: string, recordType: keyof typeof DnsType = "A", timeout = DEFAULT_TIMEOUT): Promise<string[]> {
         if (this.isClosed || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
             throw new Error("WebSocket not connected");
         }
 
-        const id = this.nextId++;
+        // 检查pending请求数量
+        if (this.pending.size >= MAX_PENDING_REQUESTS) {
+            throw new Error("Too many pending requests");
+        }
+
+        const id = this.nextResourceId();
         const recId = DnsType[recordType] as unknown as number;
 
-        // 裸二进制编码：nameLen(2字节小端) + name + recordType(1字节)
         const nameBytes = new TextEncoder().encode(name);
         if (nameBytes.length > 65535) {
             throw new Error("DNS name too long");
@@ -198,7 +246,6 @@ export default class ProxyClient {
             throw err;
         }
 
-        // 裸二进制解码：count(2字节小端) + [ipLen(2字节小端) + ip]...
         let respPos = 0;
         if (response.length < 2) {
             throw new Error("Invalid DNS response: too short");
@@ -230,7 +277,11 @@ export default class ProxyClient {
             throw new Error("WebSocket not connected");
         }
 
-        const id = this.nextId++;
+        if (this.pending.size >= MAX_PENDING_REQUESTS) {
+            throw new Error("Too many pending requests");
+        }
+
+        const id = this.nextResourceId();
         const header = new Headers(init?.headers);
         const req = {
             method: init?.method || "GET",
@@ -240,20 +291,17 @@ export default class ProxyClient {
 
         const responsePromise = this.receiveResponse(id, timeout);
 
-        // whether to enable chunked?
-        let chunked = true;
-        if (header.get('Content-Length')?.match(/^[0-9]+$/)) {
-            chunked = false;
-        }
-
         try {
             this.send(MessageType.HTTP_REQUEST, id, encode(req));
 
             if (init?.body) {
-                await this.sendBody(id, init.body, chunked);
+                this.sendBody(id, init.body).catch(err => {
+                    this.logger.debug("sendBody error", { error: getErrMsg(err) });
+                });
             }
 
-            return await responsePromise;
+            const response = await responsePromise;
+            return response;
         } catch (err) {
             this.pending.delete(id);
             throw err;
@@ -261,10 +309,10 @@ export default class ProxyClient {
     }
 
     private createReadStream(id: number): ReadableStream<Uint8Array> {
-        // 立即创建一个pending handler，避免被覆盖
         this.pending.set(id, {
             resolve: () => { },
             reject: () => { },
+            createdAt: Date.now()
         });
 
         return new ReadableStream({
@@ -282,21 +330,39 @@ export default class ProxyClient {
         });
     }
 
-    private async sendBody(id: number, body: BodyInit, chunked: boolean) {
-        const stream = body instanceof ReadableStream ? body :
-            new Response(body).body!;
+    /**
+     * 清理超时的pending请求
+     */
+    private cleanupPendingRequests() {
+        const now = Date.now();
+        const maxAge = 120000; // 2分钟
+        let cleaned = 0;
+
+        for (const [id, handler] of this.pending) {
+            if (now - handler.createdAt > maxAge) {
+                handler.reject(new Error("Request timeout (cleanup)"));
+                this.pending.delete(id);
+                cleaned++;
+            }
+        }
+
+        if (cleaned > 0) {
+            this.logger.debug("Cleaned up stale pending requests", { cleaned, remaining: this.pending.size });
+        }
+    }
+
+    private async sendBody(id: number, body: BodyInit) {
+        const stream = body instanceof ReadableStream ? body : new Response(body).body!;
         const reader = stream.getReader();
 
         try {
             while (true) {
+                while (this.ws && this.ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                    await new Promise(r => setTimeout(r, 10));
+                }
+                
                 const { done, value } = await reader.read();
                 if (done) break;
-
-                if (chunked){
-                    const hex = value.length.toString(16);
-                    this.send(MessageType.HTTP_BODY_CHUNK, id, new TextEncoder().encode(hex + '\r\n'));
-                }
-
                 this.send(MessageType.HTTP_BODY_CHUNK, id, value);
             }
         } finally {
@@ -312,47 +378,43 @@ export default class ProxyClient {
                 reject(new Error(`HTTP request timeout after ${timeout}ms`));
             }, timeout);
 
+            // We pre-create the body stream and capture its controller synchronously
+            // so it's ready before the first HTTP_BODY_CHUNK arrives.
+            let bodyCtrl: ReadableStreamDefaultController<Uint8Array>;
+            const bodyStream = new ReadableStream<Uint8Array>({
+                start: (ctrl) => { bodyCtrl = ctrl; }
+            });
+
             this.pending.set(id, {
                 resolve: (data) => {
                     clearTimeout(timeoutId);
                     try {
                         const resp = decode<HTTPResponse>(data);
-                        const bodyStream = new ReadableStream({
-                            start: (ctrl) => {
-                                const existing = this.pending.get(id);
-                                if (existing) {
-                                    existing.stream = ctrl;
-                                } else {
-                                    this.pending.set(id, {
-                                        resolve: () => { },
-                                        reject: () => { },
-                                        stream: ctrl,
-                                    });
-                                }
-                            }
-                        });
+                        // Reuse the same pending entry; just upgrade resolve/reject to no-ops
+                        // and wire the already-created stream controller.
+                        const entry = this.pending.get(id)!;
+                        entry.resolve = () => {};
+                        entry.reject = () => {};
+                        entry.stream = bodyCtrl;
 
-                        // create Response
-                        const response = new Response(bodyStream, resp);
+                        const response = new Response(resp.body ? bodyStream : null, resp);
                         Reflect.defineProperty(response, "url", {
-                            configurable: true,
-                            enumerable: true,
-                            writable: false,
+                            configurable: true, enumerable: true, writable: false,
                             value: resp.url
-                        }); // overwrite URL
+                        });
                         resolve(response);
-
-                        // return state: chunked?
-                        if (response.headers.get('transfer-encoding') == 'chunked')
-                            return true;
                     } catch (err) {
                         reject(new Error(`Failed to decode response: ${getErrMsg(err)}`));
                     }
                 },
                 reject: (err) => {
                     clearTimeout(timeoutId);
+                    // close bodyStream on reject too
+                    try { bodyCtrl?.error(err); } catch { /* ignore */ }
                     reject(err);
                 },
+                stream: undefined as unknown as ReadableStreamDefaultController<Uint8Array>,
+                createdAt: Date.now()
             });
         });
     }
@@ -375,17 +437,33 @@ export default class ProxyClient {
     }
 
     private dispatch(msg: ProxyMessage) {
-        // Handle heartbeat messages without a handler
         if (msg.type === MessageType.HEARTBEAT) {
             this.lastHeartbeat = Date.now();
             this.resetHeartbeatTimeout();
-            this.send(MessageType.HEARTBEAT, msg.resourceId, msg.data);
+            // Client initiated the heartbeat; server replied. Do NOT echo back (would loop).
             return;
         }
 
         const handler = this.pending.get(msg.resourceId);
         if (!handler) {
             this.logger.warn(`No handler for message ${msg.type}, id=${msg.resourceId}`);
+            // close connection
+            switch (msg.type) {
+                case MessageType.TCP_CONNECT:
+                case MessageType.TCP_CONNECT_ACK:
+                case MessageType.TCP_DATA:
+                    this.send(MessageType.TCP_CLOSE, msg.resourceId, new Uint8Array(0));
+                break;
+                case MessageType.UDP_BIND:
+                case MessageType.UDP_BIND_ACK:
+                case MessageType.UDP_DATA:
+                case MessageType.UDP_CLOSE:
+                    this.send(MessageType.UDP_CLOSE, msg.resourceId, new Uint8Array(0));
+                break;
+                case MessageType.HTTP_BODY_CHUNK:
+                    this.send(MessageType.HTTP_BODY_END, msg.resourceId, new Uint8Array(0));
+                break;
+            }
             return;
         }
 
@@ -426,19 +504,12 @@ export default class ProxyClient {
                 break;
 
             case MessageType.HTTP_RESPONSE:
-                // Note: here we would check whether a chunked response.
-                handler.chunked = handler.resolve(msg.data);
+                handler.resolve(msg.data);
                 break;
 
             case MessageType.HTTP_BODY_CHUNK:
                 try {
-                    if (handler.chunked) {
-                        const lenHex = msg.data.length.toString(16);
-                        handler.stream!.enqueue(new TextEncoder().encode(lenHex + '\r\n'));
-                    }
                     handler.stream!.enqueue(msg.data);
-                    if (handler.chunked)
-                        handler.stream!.enqueue(new TextEncoder().encode('\r\n'));
                 } catch (err) {
                     this.logger.debug("HTTP body enqueue failed", { 
                         error: getErrMsg(err),
@@ -449,8 +520,6 @@ export default class ProxyClient {
 
             case MessageType.HTTP_BODY_END:
                 try {
-                    if (handler.chunked)
-                        handler.stream!.enqueue(new TextEncoder().encode('0\r\n\r\n'));
                     handler.stream!.close();
                 } catch (err) {
                     this.logger.debug("HTTP body close failed", { 
@@ -464,6 +533,9 @@ export default class ProxyClient {
             case MessageType.ERROR: {
                 const errMsg = new TextDecoder().decode(msg.data);
                 this.logger.error(`Error for id=${msg.resourceId}: ${errMsg}`);
+                try {
+                    handler.stream?.error(new Error(errMsg));
+                } catch { /* ignore */ }
                 handler.reject(new Error(errMsg));
                 this.pending.delete(msg.resourceId);
                 break;
@@ -481,53 +553,18 @@ export default class ProxyClient {
                 reject(new Error(`Request timeout after ${timeout}ms`));
             }, timeout);
 
-            this.pending.set(id, {
-                resolve: (data) => {
-                    clearTimeout(timeoutId);
-                    resolve(data);
-                },
-                reject: (err) => {
-                    clearTimeout(timeoutId);
-                    reject(err);
-                }
-            });
-            this.send(type, id, data);
-        });
-    }
-
-    private requestForConnect(id: number, data: Uint8Array, timeout = DEFAULT_TIMEOUT): Promise<Uint8Array> {
-        return new Promise((resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-                this.pending.delete(id);
-                reject(new Error(`Request timeout after ${timeout}ms`));
-            }, timeout);
-
-            // 保留现有的 handler（可能包含 stream），只更新 resolve/reject
             const existing = this.pending.get(id);
             if (existing) {
-                existing.resolve = (data) => {
-                    clearTimeout(timeoutId);
-                    resolve(data);
-                };
-                existing.reject = (err) => {
-                    clearTimeout(timeoutId);
-                    reject(err);
-                };
-                existing.timeout = timeoutId;
+                existing.resolve = (data) => { clearTimeout(timeoutId); resolve(data); };
+                existing.reject = (err) => { clearTimeout(timeoutId); reject(err); };
             } else {
                 this.pending.set(id, {
-                    resolve: (data) => {
-                        clearTimeout(timeoutId);
-                        resolve(data);
-                    },
-                    reject: (err) => {
-                        clearTimeout(timeoutId);
-                        reject(err);
-                    },
-                    timeout: timeoutId
+                    resolve: (data) => { clearTimeout(timeoutId); resolve(data); },
+                    reject: (err) => { clearTimeout(timeoutId); reject(err); },
+                    createdAt: Date.now()
                 });
             }
-            this.send(MessageType.TCP_CONNECT, id, data);
+            this.send(type, id, data);
         });
     }
 
@@ -597,6 +634,8 @@ export default class ProxyClient {
 
         if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
         if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
+        // FIX: 清理pending清理定时器
+        if (this.pendingCleanupInterval) clearInterval(this.pendingCleanupInterval);
 
         const pendingCount = this.pending.size;
         if (pendingCount > 0) {
@@ -624,11 +663,12 @@ export default class ProxyClient {
         if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
         if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
 
-        this.heartbeatInterval = setInterval(() => {
+        const checkHeartbeat = () => {
             if (this.isClosed) return;
-            this.send(MessageType.HEARTBEAT, 0, new Uint8Array([Date.now()]));
-        }, HEARTBEAT_INTERVAL);
+            this.send(MessageType.HEARTBEAT, 0, new Uint8Array(0));
+        };
 
+        this.heartbeatInterval = setInterval(checkHeartbeat, HEARTBEAT_INTERVAL);
         this.resetHeartbeatTimeout();
     }
 
@@ -639,16 +679,6 @@ export default class ProxyClient {
             this.logger.warn("Heartbeat timeout, closing connection");
             this.handleDisconnect();
         }, HEARTBEAT_TIMEOUT);
-    }
-
-    getConnectionState() {
-        return {
-            state: this.connectionState,
-            isClosed: this.isClosed,
-            pendingRequests: this.pending.size,
-            queuedMessages: this.messageQueue.length,
-            webSocketState: this.ws?.readyState
-        };
     }
 }
 

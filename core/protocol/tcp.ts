@@ -5,20 +5,25 @@ import { decode } from "../../utils/bjson.ts";
 
 const BUFFER_SIZE = 16384;
 const CONNECT_TIMEOUT = 30000;
+const MAX_WS_BUFFERED_AMOUNT = 1024 * 1024;
 
 export class TCPProxy {
     private connections = new Map<number, Deno.TcpConn>();
     private closingConnections = new Set<number>();
+    private getBufferedAmount: () => number;
 
     constructor(
         private sendMessage: (type: MessageType, id: number, data: Uint8Array) => void,
-        private logger?: Log
-    ) { }
+        private logger?: Log,
+        getBufferedAmount?: () => number
+    ) {
+        this.getBufferedAmount = getBufferedAmount || (() => 0);
+    }
 
     async handleConnect(resourceId: number, data: Uint8Array) {
         let conn: Deno.TcpConn | null = null;
+        const decoded = decode<[string, number]>(data);
         try {
-            const decoded = decode<[string, number]>(data);
             if (!Array.isArray(decoded) || decoded.length !== 2) {
                 throw new Error("Invalid connect data format");
             }
@@ -34,7 +39,6 @@ export class TCPProxy {
                 port
             });
 
-            // 设置连接超时
             conn = await Promise.race([
                 Deno.connect({ hostname: host, port }),
                 new Promise<Deno.TcpConn>((_, reject) => 
@@ -45,7 +49,7 @@ export class TCPProxy {
             this.connections.set(resourceId, conn);
             this.sendMessage(MessageType.TCP_CONNECT_ACK, resourceId, new Uint8Array(0));
 
-            this.logger?.info("TCP connection established", {
+            this.logger?.debug("TCP connection established", {
                 resourceId: resourceId.toString(),
                 host,
                 port,
@@ -54,7 +58,12 @@ export class TCPProxy {
 
             this.pipeToWebSocket(resourceId, conn, host, port);
         } catch (err) {
-            this.logger?.error("TCP connect failed", getErrMsg(err));
+            this.logger?.error("TCP connect failed", {
+                resourceId: resourceId.toString(),
+                host: (decoded?.[0]) || 'unknown',
+                port: (decoded?.[1]) || 'unknown',
+                error: getErrMsg(err)
+            });
             if (conn) {
                 try { conn.close(); } catch { /* ignore */ }
             }
@@ -73,24 +82,24 @@ export class TCPProxy {
         }
 
         if (this.closingConnections.has(resourceId)) {
-            this.logger?.debug("Ignoring data for closing connection", {
-                resourceId: resourceId.toString()
-            });
             return;
         }
 
         conn.write(data).catch((err) => {
-            this.logger?.debug("TCP write failed", {
-                resourceId: resourceId.toString(),
-                error: getErrMsg(err)
-            });
+            const msg = getErrMsg(err).toLowerCase();
+            if (!msg.includes("closed") && !msg.includes("broken pipe")) {
+                this.logger?.debug("TCP write failed", {
+                    resourceId: resourceId.toString(),
+                    error: getErrMsg(err)
+                });
+            }
             this.close(resourceId);
         });
     }
 
     close(resourceId: number) {
         if (this.closingConnections.has(resourceId)) {
-            return; // Already closing
+            return;
         }
 
         const conn = this.connections.get(resourceId);
@@ -99,57 +108,42 @@ export class TCPProxy {
         this.closingConnections.add(resourceId);
 
         try {
-            this.logger?.debug("Closing TCP connection", {
-                resourceId: resourceId.toString()
-            });
             conn.close();
-        } catch (err) {
-            this.logger?.debug("Error closing TCP connection", {
-                resourceId: resourceId.toString(),
-                error: getErrMsg(err)
-            });
-        }
+        } catch { /* ignore */ }
 
         this.connections.delete(resourceId);
         this.closingConnections.delete(resourceId);
 
-        // 通知对端连接已关闭
         try {
             this.sendMessage(MessageType.TCP_CLOSE, resourceId, new Uint8Array(0));
-        } catch (err) {
-            this.logger?.debug("Error sending TCP_CLOSE", {
-                error: getErrMsg(err)
-            });
-        }
+        } catch { /* ignore */ }
     }
 
     private async pipeToWebSocket(resourceId: number, conn: Deno.TcpConn, host: string, port: number) {
-        // 每个连接使用独立的 buffer，避免数据竞争
-        const buffer = new Uint8Array(BUFFER_SIZE);
+        const buffer = new Uint8Array(65536); // 64KB read buffer
         
         try {
             while (!this.closingConnections.has(resourceId)) {
-                const n = await conn.read(buffer);
-                if (n === null) {
-                    this.logger?.debug("TCP connection closed by remote", {
-                        resourceId: resourceId.toString(),
-                        host,
-                        port
-                    });
-                    break;
+                if (!this.connections.has(resourceId)) break;
+
+                // Backpressure: wait if WS buffer is saturated
+                if (this.getBufferedAmount() > MAX_WS_BUFFERED_AMOUNT) {
+                    await new Promise(r => setTimeout(r, 5));
+                    continue;
                 }
-                this.sendMessage(MessageType.TCP_DATA, resourceId, buffer.slice(0, n));
+                
+                const n = await conn.read(buffer);
+                if (n === null) break;
+                if (n === 0) continue;
+                
+                // Use subarray (no allocation) for small reads, slice only for large
+                this.sendMessage(MessageType.TCP_DATA, resourceId,
+                    n === buffer.length ? buffer.slice() : buffer.subarray(0, n));
             }
         } catch (err) {
             const errorMsg = getErrMsg(err);
-            // 忽略预期的错误
-            if (!errorMsg.includes("closed") && !errorMsg.includes("broken pipe")) {
-                this.logger?.debug("TCP pipe error", {
-                    resourceId: resourceId.toString(),
-                    host,
-                    port,
-                    error: errorMsg
-                });
+            if (!errorMsg.includes("closed") && !errorMsg.includes("broken pipe") && !errorMsg.includes("Bad resource")) {
+                this.logger?.debug("TCP pipe error", { resourceId: resourceId.toString(), host, port, error: errorMsg });
             }
         } finally {
             this.close(resourceId);
@@ -172,9 +166,8 @@ export class TCPProxy {
         const count = this.connections.size;
         if (count === 0) return;
 
-        this.logger?.info("Closing all TCP connections", { count });
+        this.logger?.debug("Closing all TCP connections", { count });
         
-        // 复制 keys 避免在迭代过程中修改
         const ids = [...this.connections.keys()];
         for (const id of ids) {
             this.close(id);

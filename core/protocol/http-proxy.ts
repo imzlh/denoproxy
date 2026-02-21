@@ -3,8 +3,9 @@ import { getErrMsg } from "../../utils/error.ts";
 import { HTTPResponse, MessageType } from "../protocol.ts";
 import { Log } from "@cross/log";
 
-const FETCH_TIMEOUT = 30000; // 30秒请求超时
-const MAX_BODY_CHUNK_SIZE = 65536; // 64KB
+const FETCH_TIMEOUT = 25000; // Must be less than client's 30s timeout so server errors first
+const MAX_RESPONSE_SIZE = 100 * 1024 * 1024;
+const MAX_WS_BUFFERED = 4 * 1024 * 1024; // 4MB backpressure threshold
 
 interface SerializedRequest {
     method: string;
@@ -15,11 +16,15 @@ interface SerializedRequest {
 export class HTTPProxy {
     private requests = new Map<number, AbortController>();
     private bodyControllers = new Map<number, ReadableStreamDefaultController<Uint8Array>>();
+    private getBufferedAmount: () => number;
 
     constructor(
         private sendMessage: (type: MessageType, id: number, data: Uint8Array) => void,
-        private logger?: Log
-    ) { }
+        private logger?: Log,
+        getBufferedAmount?: () => number
+    ) {
+        this.getBufferedAmount = getBufferedAmount || (() => 0);
+    }
 
     async handleRequest(resourceId: number, data: Uint8Array) {
         let controller: AbortController | null = null;
@@ -30,6 +35,16 @@ export class HTTPProxy {
             // 验证请求
             if (!req.url || !req.method) {
                 throw new Error("Invalid request: missing URL or method");
+            }
+
+            // URL 验证
+            try {
+                const url = new URL(req.url);
+                if (!['http:', 'https:'].includes(url.protocol)) {
+                    throw new Error(`Unsupported protocol: ${url.protocol}`);
+                }
+            } catch (e) {
+                throw new Error(`Invalid URL: ${getErrMsg(e)}`);
             }
 
             controller = new AbortController();
@@ -49,12 +64,18 @@ export class HTTPProxy {
                 controller?.abort(new Error("Request timeout"));
             }, FETCH_TIMEOUT);
 
-            const response = await fetch(req.url, {
-                method: req.method,
-                headers,
-                body: hasBody ? this.createBodyStream(resourceId) : undefined,
-                signal: controller.signal,
-            });
+            let response: Response;
+            try {
+                response = await fetch(req.url, {
+                    method: req.method,
+                    headers,
+                    body: hasBody ? this.createBodyStream(resourceId) : undefined,
+                    signal: controller.signal,
+                });
+            } catch (err) {
+                clearTimeout(timeoutId);
+                throw err;
+            }
 
             clearTimeout(timeoutId);
 
@@ -72,7 +93,7 @@ export class HTTPProxy {
                 error: errorMsg
             });
             this.sendError(resourceId, errorMsg);
-            this.requests.delete(resourceId);
+            this.cleanupRequest(resourceId);
         }
     }
 
@@ -86,13 +107,6 @@ export class HTTPProxy {
         }
 
         try {
-            // 如果 chunk 太大，可能需要分片处理
-            if (data.length > MAX_BODY_CHUNK_SIZE) {
-                this.logger?.debug("Large body chunk received", {
-                    resourceId: resourceId.toString(),
-                    size: data.length
-                });
-            }
             controller.enqueue(data);
         } catch (err) {
             this.logger?.debug("HTTP body enqueue failed", {
@@ -145,8 +159,14 @@ export class HTTPProxy {
     }
 
     private clone(response: Response): HTTPResponse {
+        const headers: Record<string, string> = {};
+        for (const [key, value] of response.headers.entries()) {
+            if (key.toLowerCase() !== 'transfer-encoding') {
+                headers[key] = value;
+            }
+        }
         return {
-            headers: Object.fromEntries(response.headers.entries()),
+            headers,
             status: response.status,
             statusText: response.statusText,
             url: response.url,
@@ -155,38 +175,55 @@ export class HTTPProxy {
     }
 
     private async sendResponse(resourceId: number, response: Response) {
+        let totalSize = 0;
+        
         try {
-            this.sendMessage(
-                MessageType.HTTP_RESPONSE,
-                resourceId,
-                encode(this.clone(response))
-            );
+            this.sendMessage(MessageType.HTTP_RESPONSE, resourceId, encode(this.clone(response)));
 
             if (response.body) {
                 const reader = response.body.getReader();
                 try {
                     while (true) {
+                        // Backpressure: if WS buffer is saturated, yield to event loop
+                        if (this.getBufferedAmount() > MAX_WS_BUFFERED) {
+                            await new Promise(r => setTimeout(r, 0));
+                        }
+
                         const { done, value } = await reader.read();
                         if (done) break;
+                        
+                        totalSize += value.length;
+                        if (totalSize > MAX_RESPONSE_SIZE) {
+                            this.logger?.warn("Response size limit exceeded", {
+                                resourceId: resourceId.toString(), size: totalSize
+                            });
+                            break;
+                        }
+                        
                         this.sendMessage(MessageType.HTTP_BODY_CHUNK, resourceId, value);
                     }
                 } finally {
                     reader.releaseLock();
-                    this.sendMessage(MessageType.HTTP_BODY_END, resourceId, new Uint8Array(0));
-                    this.requests.delete(resourceId);
                 }
-            } else {
-                this.sendMessage(MessageType.HTTP_BODY_END, resourceId, new Uint8Array(0));
-                this.requests.delete(resourceId);
             }
+            
+            this.sendMessage(MessageType.HTTP_BODY_END, resourceId, new Uint8Array(0));
         } catch (err) {
             this.logger?.error("Failed to send HTTP response", {
-                resourceId: resourceId.toString(),
-                error: getErrMsg(err)
+                resourceId: resourceId.toString(), error: getErrMsg(err)
             });
             this.sendError(resourceId, getErrMsg(err));
-            this.requests.delete(resourceId);
+        } finally {
+            this.cleanupRequest(resourceId);
         }
+    }
+
+    /**
+     * 清理请求相关资源
+     */
+    private cleanupRequest(resourceId: number) {
+        this.requests.delete(resourceId);
+        this.bodyControllers.delete(resourceId);
     }
 
     private sendError(resourceId: number, message: string) {

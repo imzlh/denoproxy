@@ -43,7 +43,8 @@ export class DNSProxy {
             pos += nameLen;
             const recordType = data[pos] as DnsType;
 
-            if (!DnsType2String(recordType)) {
+            const recordTypeStr = DnsType2String(recordType);
+            if (recordTypeStr === 'UNKNOWN') {
                 throw new Error(`Unsupported DNS record type: ${recordType}`);
             }
 
@@ -67,7 +68,7 @@ export class DNSProxy {
 
             this.pendingQueries.set(resourceId, { name, recordType, startTime, timeoutId });
 
-            const result = await Deno.resolveDns(name, DnsType2String(recordType) as 'A' | 'AAAA' | 'ANAME' | 'CNAME' | 'NS' | 'PTR');
+            const result = await Deno.resolveDns(name, recordTypeStr as 'A' | 'AAAA' | 'ANAME' | 'CNAME' | 'NS' | 'PTR');
             
             // 查询完成，清除超时
             if (timeoutId) clearTimeout(timeoutId);
@@ -122,11 +123,8 @@ export class DNSProxy {
 
     private sendError(resourceId: number, message: string) {
         try {
-            const msgBytes = new TextEncoder().encode(message);
-            const response = new Uint8Array(1 + msgBytes.length);
-            response[0] = 1; // error flag
-            response.set(msgBytes, 1);
-            this.sendMessage(MessageType.ERROR, resourceId, response);
+            const data = new TextEncoder().encode(message);
+            this.sendMessage(MessageType.ERROR, resourceId, data);
         } catch (err) {
             this.logger?.error("Failed to send DNS error", {
                 resourceId: resourceId.toString(),

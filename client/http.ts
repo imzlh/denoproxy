@@ -1,6 +1,6 @@
-import ProxyClient from "../core/client.ts"
-import { ProxyDecision } from "./proxy-decision.ts";
-import { Log } from "@cross/log";
+import type ProxyClient from "../core/client.ts"
+import type { ProxyDecision } from "./proxy-decision.ts";
+import type { Log } from "@cross/log";
 import { createParser, TYPE, METHODS } from "llhttp-wasm";
 import { getErrMsg } from "../utils/error.ts";
 
@@ -28,19 +28,17 @@ export class HTTPProxyHandler {
 
     async handle(conn: Deno.Conn, firstChunk: Uint8Array) {
         const remoteAddr = (conn.remoteAddr as Deno.NetAddr).hostname;
-        let buffer = firstChunk;
-        let keepAlive = true;
+        // leftover accumulates bytes read from conn but not yet consumed by a request
+        let leftover = firstChunk;
 
-        while (keepAlive) {
+        while (true) {
             try {
-                const req = await this.readHTTPRequest(conn, buffer);
+                const result = await this.readHTTPRequest(conn, leftover);
                 
-                if (!req) {
-                    break;
-                }
+                if (!result) break;
 
-                keepAlive = req.keepAlive;
-                buffer = new Uint8Array(0);
+                const { req, remaining } = result;
+                leftover = remaining;
 
                 if (!req.proxy) {
                     await this.handleLocalRequest(req, conn);
@@ -50,7 +48,7 @@ export class HTTPProxyHandler {
 
                 if (req.method === "CONNECT") {
                     await this.handleConnect(req, conn, remoteAddr);
-                    break;
+                    return;
                 } else {
                     const shouldContinue = await this.handleHTTP(req, conn, remoteAddr);
                     if (!shouldContinue) break;
@@ -64,7 +62,9 @@ export class HTTPProxyHandler {
             }
         }
 
-        conn.close();
+        try {
+            conn.close();
+        } catch { /* ignore Bad resource ID */ }
     }
 
     private async handleLocalRequest(req: HTTPData, conn: Deno.Conn) {
@@ -82,33 +82,78 @@ export class HTTPProxyHandler {
         }
     }
 
-    private readHTTPRequest(conn: Deno.Conn, firstChunk: Uint8Array): Promise<HTTPData | null> {
+    private readHTTPRequest(
+        conn: Deno.Conn,
+        firstChunk: Uint8Array
+    ): Promise<{ req: HTTPData; remaining: Uint8Array } | null> {
         return new Promise((resolve, reject) => {
             const parser = createParser(TYPE.REQUEST);
             let resolved = false;
             let bodyWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
             let timeoutId: number | null = null;
-            
+            // We accumulate ALL bytes fed to the parser so we can slice off
+            // whatever the parser did not consume (= next request's bytes).
+            const fed: Uint8Array[] = [];
+            let fedTotal = 0;
+            // Byte offset inside the accumulated buffer where the parser paused.
+            // -1 means "parser consumed everything so far".
+            let pauseOffset = -1;
+
             const cleanup = () => {
                 resolved = true;
                 if (timeoutId) clearTimeout(timeoutId);
                 if (bodyWriter) {
-                    try { bodyWriter.releaseLock(); } catch { /* ignore */ }
+                    try { bodyWriter.close(); } catch { /* ignore */ }
+                    bodyWriter = null;
                 }
             };
 
             const safeReject = (reason: unknown) => {
-                if (!resolved) {
-                    cleanup();
-                    reject(reason);
-                }
+                if (!resolved) { cleanup(); reject(reason); }
             };
 
             const safeResolve = (data: HTTPData | null) => {
                 if (!resolved) {
                     cleanup();
-                    resolve(data);
+                    if (data === null) {
+                        resolve(null);
+                        return;
+                    }
+                    // Compute remaining bytes: everything after pauseOffset
+                    let remaining: Uint8Array;
+                    if (pauseOffset >= 0 && pauseOffset < fedTotal) {
+                        // Flatten accumulated chunks into one buffer then slice
+                        const all = new Uint8Array(fedTotal);
+                        let pos = 0;
+                        for (const c of fed) { all.set(c, pos); pos += c.length; }
+                        remaining = all.slice(pauseOffset);
+                    } else {
+                        remaining = new Uint8Array(0);
+                    }
+                    resolve({ req: data, remaining });
                 }
+            };
+
+            // Track bytes fed to parser; record pause position when errno===22
+            const feedParser = (buf: Uint8Array): number => {
+                const offsetBefore = fedTotal;
+                fed.push(buf);
+                fedTotal += buf.length;
+                const errno = parser.execute(buf);
+                if (errno === 22) {
+                    // HPE_PAUSED: parser stopped somewhere inside buf.
+                    // Use getErrorPos() if available, otherwise assume it consumed
+                    // exactly up to the end of headers (we'll get extra bytes which
+                    // is fine - llhttp will reject them on next parse if wrong).
+                    try {
+                        // getErrorPos returns offset relative to the buffer passed to execute
+                        const posInBuf: number = (parser as any).getErrorPos?.() ?? buf.length;
+                        pauseOffset = offsetBefore + posInBuf;
+                    } catch {
+                        pauseOffset = offsetBefore + buf.length;
+                    }
+                }
+                return errno;
             };
 
             timeoutId = setTimeout(() => {
@@ -120,7 +165,7 @@ export class HTTPProxyHandler {
                 let errno = 0;
                 
                 if (firstChunk.length) {
-                    errno = parser.execute(firstChunk);
+                    errno = feedParser(firstChunk);
                 }
                 
                 while (!resolved && errno !== 22) {
@@ -128,34 +173,36 @@ export class HTTPProxyHandler {
                         safeReject(new Error(`HTTP parse error: ${parser.getErrorReason(errno)}`));
                         return;
                     }
-                    
                     try {
                         const n = await conn.read(chunk);
-                        if (n === null) {
-                            if (!resolved) safeResolve(null);
-                            return;
-                        }
+                        if (n === null) { if (!resolved) safeResolve(null); return; }
                         if (n === 0) continue;
-                        
-                        errno = parser.execute(chunk.subarray(0, n));
+                        errno = feedParser(chunk.subarray(0, n));
                     } catch (err) {
                         safeReject(err);
                         return;
                     }
                 }
+
+                // Feed body bytes (POST/PUT with body); keepAlive is forced false
+                // for requests with body so there's no next-request race.
+                while (bodyWriter) {
+                    try {
+                        const n = await conn.read(chunk);
+                        if (n === null) break;
+                        if (n === 0) continue;
+                        parser.execute(chunk.subarray(0, n));
+                    } catch { break; }
+                }
             })();
 
             const stream = new TransformStream<Uint8Array, Uint8Array>({
                 start: () => {},
-                transform: (chunk, controller) => {
-                    controller.enqueue(chunk);
-                }
+                transform: (chunk, controller) => { controller.enqueue(chunk); }
             });
 
             parser.onBody = (data: Uint8Array) => {
-                if (!bodyWriter) {
-                    bodyWriter = stream.writable.getWriter();
-                }
+                if (!bodyWriter) bodyWriter = stream.writable.getWriter();
                 bodyWriter.write(data).catch((e) => {
                     this.logger.debug("HTTP body write error", { error: getErrMsg(e) });
                     safeReject(e);
@@ -172,7 +219,6 @@ export class HTTPProxyHandler {
                     
                     const connectUrl = headers.get('host') || h.url!;
                     
-                    // 检查 keep-alive (处理 Proxy-Connection 和 Connection)
                     const connection = headers.get('connection') || '';
                     const proxyConnection = headers.get('proxy-connection') || '';
                     const isKeepAlive = h.versionMajor === 1 && h.versionMinor === 1 
@@ -182,28 +228,18 @@ export class HTTPProxyHandler {
                     if (h.method === METHODS.CONNECT) {
                         const match = connectUrl.match(/^([a-z0-9\-\.]+):(\d{1,5})$/i);
                         if (!match) {
-                            this.logger.error("Invalid CONNECT request", { connectUrl });
                             safeReject(new Error("Invalid CONNECT request"));
                             return 24;
                         }
-                        
                         const [, host, portStr] = match;
                         const port = Number(portStr);
-                        
                         if (port < 1 || port > 65535) {
                             safeReject(new Error("Invalid port in CONNECT request"));
                             return 24;
                         }
-                        
                         safeResolve({
-                            method: "CONNECT",
-                            url: '/',
-                            host,
-                            port,
-                            headers,
-                            bodyStream: conn.readable,
-                            proxy: true,
-                            keepAlive: false
+                            method: "CONNECT", url: '/', host, port, headers,
+                            bodyStream: conn.readable, proxy: true, keepAlive: false
                         });
                         return 0;
                     }
@@ -221,13 +257,9 @@ export class HTTPProxyHandler {
                     try {
                         if (parser.url.startsWith('/')) {
                             const hostHeader = headers.get("host");
-                            if (!hostHeader) {
-                                safeReject(new Error("Missing Host header"));
-                                return 24;
-                            }
-                            const [h, p] = hostHeader.split(':');
-                            host = h;
-                            port = p ? parseInt(p) : 80;
+                            if (!hostHeader) { safeReject(new Error("Missing Host header")); return 24; }
+                            const [h2, p] = hostHeader.split(':');
+                            host = h2; port = p ? parseInt(p) : 80;
                             url = new URL(parser.url, `http://${hostHeader}`);
                         } else {
                             // FIXME: bug: llhttp cannot parse proxy URL
@@ -242,14 +274,10 @@ export class HTTPProxyHandler {
                     }
 
                     safeResolve({
-                        method,
-                        url: url.toString(),
-                        host,
-                        port,
-                        headers,
-                        bodyStream: stream.readable,
-                        proxy: true,
-                        keepAlive: isKeepAlive
+                        method, url: url.toString(), host, port, headers,
+                        bodyStream: stream.readable, proxy: true,
+                        // Disable keep-alive when request has body to avoid conn.read race
+                        keepAlive: isKeepAlive && !headers.get('content-length') && !headers.get('transfer-encoding')
                     });
                     return 0;
                 } catch (err) {
@@ -277,19 +305,12 @@ export class HTTPProxyHandler {
             shouldProxy = true;
         }
 
-        this.logger.info("HTTP CONNECT routing decision", {
+        this.logger.debug("HTTP CONNECT routing decision", {
             remoteAddr,
             host: req.host,
             port: req.port,
             route: shouldProxy ? "proxy" : "direct"
         });
-
-        try {
-            await conn.write(new TextEncoder().encode("HTTP/1.1 200 Connection Established\r\n\r\n"));
-        } catch (err) {
-            this.logger.error("Failed to send CONNECT response", { error: getErrMsg(err) });
-            return;
-        }
 
         try {
             if (shouldProxy) {
@@ -301,17 +322,19 @@ export class HTTPProxyHandler {
 
                 const stream = await this.client.connectTCP(req.host, req.port, CONNECT_TIMEOUT);
 
-                const clientToProxy = req.bodyStream.pipeTo(stream.writable).catch((err) => {
+                await conn.write(new TextEncoder().encode("HTTP/1.1 200 Connection Established\r\n\r\n"));
+
+                const clientToProxy = req.bodyStream.pipeTo(stream.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("Client to proxy pipe closed", { error: getErrMsg(err) });
                 });
 
-                const proxyToClient = stream.readable.pipeTo(conn.writable).catch((err) => {
+                const proxyToClient = stream.readable.pipeTo(conn.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("Proxy to client pipe closed", { error: getErrMsg(err) });
                 });
 
                 await Promise.all([clientToProxy, proxyToClient]);
 
-                this.logger.info("Proxy connection closed", {
+                this.logger.debug("Proxy connection closed", {
                     remoteAddr,
                     host: req.host,
                     port: req.port
@@ -325,29 +348,46 @@ export class HTTPProxyHandler {
 
                 const remote = await Deno.connect({ hostname: req.host, port: req.port });
 
-                const clientToRemote = req.bodyStream.pipeTo(remote.writable).catch((err) => {
+                await conn.write(new TextEncoder().encode("HTTP/1.1 200 Connection Established\r\n\r\n"));
+
+                const clientToRemote = req.bodyStream.pipeTo(remote.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("Client to remote pipe closed", { error: getErrMsg(err) });
                 });
 
-                const remoteToClient = remote.readable.pipeTo(conn.writable).catch((err) => {
+                const remoteToClient = remote.readable.pipeTo(conn.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("Remote to client pipe closed", { error: getErrMsg(err) });
                 });
 
                 await Promise.all([clientToRemote, remoteToClient]);
 
-                this.logger.info("Direct connection closed", {
+                this.logger.debug("Direct connection closed", {
                     remoteAddr,
                     host: req.host,
                     port: req.port
                 });
             }
         } catch (err) {
+            const errMsg = getErrMsg(err);
             this.logger.error("Connection error", {
                 remoteAddr,
                 host: req.host,
                 port: req.port,
-                error: getErrMsg(err)
+                error: errMsg
             });
+            
+            try {
+                if (errMsg.includes("refused") || errMsg.includes("10061")) {
+                    await conn.write(new TextEncoder().encode("HTTP/1.1 502 Bad Gateway\r\n\r\nConnection refused by target\r\n"));
+                } else if (errMsg.includes("timeout")) {
+                    await conn.write(new TextEncoder().encode("HTTP/1.1 504 Gateway Timeout\r\n\r\nConnection timeout\r\n"));
+                } else {
+                    await conn.write(new TextEncoder().encode("HTTP/1.1 502 Bad Gateway\r\n\r\nProxy error\r\n"));
+                }
+            } catch { /* ignore */ }
+        } finally {
+            try {
+                conn.close();
+            } catch { /* ignore Bad resource ID */ }
         }
     }
 
@@ -386,7 +426,7 @@ export class HTTPProxyHandler {
                 response = await fetch(fullUrl, {
                     method: req.method,
                     headers: Object.fromEntries(req.headers),
-                    body: req.bodyStream,
+                    body: hasBody ? req.bodyStream : undefined,
                 });
             }
         } catch (err) {
@@ -408,36 +448,52 @@ export class HTTPProxyHandler {
             return req.keepAlive;
         }
 
-        // 写入响应
+        // Write response - buffer headers into single write
         try {
-            const connectionHeader = req.keepAlive && response.headers.get('connection') !== 'close'
-                ? 'keep-alive' 
-                : 'close';
-            
-            const statusLine = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
-            await conn.write(new TextEncoder().encode(statusLine));
+            const responseConnection = response.headers.get('connection')?.toLowerCase() || '';
+            const isResponseKeepAlive = responseConnection !== 'close';
+            const connectionHeader = req.keepAlive && isResponseKeepAlive ? 'keep-alive' : 'close';
 
+            // Check if response already has a definite length
+            const contentLength = response.headers.get('content-length');
+            const hasDefiniteLength = !!contentLength;
+            // Use chunked encoding when keep-alive and no content-length, so client
+            // knows where body ends without closing the connection.
+            const useChunked = connectionHeader === 'keep-alive' && !hasDefiniteLength && !!response.body;
+
+            let headerStr = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
             for (const [key, value] of response.headers) {
-                if (key.toLowerCase() === 'connection') continue;
-                await conn.write(new TextEncoder().encode(`${key}: ${value}\r\n`));
+                const lk = key.toLowerCase();
+                if (lk === 'connection' || lk === 'transfer-encoding') continue;
+                headerStr += `${key}: ${value}\r\n`;
             }
-            await conn.write(new TextEncoder().encode(`Connection: ${connectionHeader}\r\n`));
-            await conn.write(new TextEncoder().encode("\r\n"));
+            if (useChunked) headerStr += `Transfer-Encoding: chunked\r\n`;
+            headerStr += `Connection: ${connectionHeader}\r\n\r\n`;
+            await conn.write(new TextEncoder().encode(headerStr));
 
             if (response.body) {
-                // 手动读取并写入，不使用 pipeTo，以便正确处理 keep-alive
                 const reader = response.body.getReader();
                 try {
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
-                        await conn.write(value);
+                        if (useChunked) {
+                            // chunked format: <hex-length>\r\n<data>\r\n
+                            await conn.write(new TextEncoder().encode(value.length.toString(16) + '\r\n'));
+                            await conn.write(value);
+                            await conn.write(new TextEncoder().encode('\r\n'));
+                        } else {
+                            await conn.write(value);
+                        }
+                    }
+                    if (useChunked) {
+                        await conn.write(new TextEncoder().encode('0\r\n\r\n'));
                     }
                 } finally {
                     reader.releaseLock();
                 }
             }
-            
+
             return connectionHeader === 'keep-alive';
         } catch (err) {
             this.logger.debug("Write HTTP response failed", { error: getErrMsg(err) });

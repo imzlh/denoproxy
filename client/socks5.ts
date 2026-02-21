@@ -15,6 +15,7 @@ const REP_GENERAL_FAILURE = 0x01;
 const REP_CONNECTION_REFUSED = 0x05;
 const REP_COMMAND_NOT_SUPPORTED = 0x07;
 const REP_ADDRESS_NOT_SUPPORTED = 0x08;
+const MAX_SESSIONS = 1024;
 
 const CONNECTION_TIMEOUT = 30000;
 
@@ -176,16 +177,12 @@ export class SOCKS5Handler {
             shouldProxy = true; // 默认使用代理
         }
 
-        this.logger.info("SOCKS5 routing decision", {
+        this.logger.debug("SOCKS5 routing decision", {
             remoteAddr,
             host,
             port,
             route: shouldProxy ? "proxy" : "direct"
         });
-
-        await sendReply(writer, REP_SUCCESS);
-        reader.releaseLock();
-        writer.releaseLock();
 
         try {
             if (shouldProxy) {
@@ -197,8 +194,11 @@ export class SOCKS5Handler {
 
                 const stream = await this.client.connectTCP(host, port, CONNECTION_TIMEOUT);
 
-                // Bidirectional pipe
-                const clientToProxy = conn.readable.pipeTo(stream.writable).catch((err) => {
+                await sendReply(writer, REP_SUCCESS);
+                reader.releaseLock();
+                writer.releaseLock();
+
+                const clientToProxy = conn.readable.pipeTo(stream.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("SOCKS5 client to proxy pipe closed", {
                         remoteAddr,
                         host,
@@ -207,7 +207,7 @@ export class SOCKS5Handler {
                     });
                 });
 
-                const proxyToClient = stream.readable.pipeTo(conn.writable).catch((err) => {
+                const proxyToClient = stream.readable.pipeTo(conn.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("SOCKS5 proxy to client pipe closed", {
                         remoteAddr,
                         host,
@@ -218,7 +218,7 @@ export class SOCKS5Handler {
 
                 await Promise.all([clientToProxy, proxyToClient]);
 
-                this.logger.info("SOCKS5 proxy connection closed", {
+                this.logger.debug("SOCKS5 proxy connection closed", {
                     remoteAddr,
                     host,
                     port
@@ -232,8 +232,11 @@ export class SOCKS5Handler {
 
                 const remote = await Deno.connect({ hostname: host, port });
 
-                // Bidirectional pipe
-                const clientToRemote = conn.readable.pipeTo(remote.writable).catch((err) => {
+                await sendReply(writer, REP_SUCCESS);
+                reader.releaseLock();
+                writer.releaseLock();
+
+                const clientToRemote = conn.readable.pipeTo(remote.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("SOCKS5 client to remote pipe closed", {
                         remoteAddr,
                         host,
@@ -242,7 +245,7 @@ export class SOCKS5Handler {
                     });
                 });
 
-                const remoteToClient = remote.readable.pipeTo(conn.writable).catch((err) => {
+                const remoteToClient = remote.readable.pipeTo(conn.writable, { preventClose: true }).catch((err) => {
                     this.logger.debug("SOCKS5 remote to client pipe closed", {
                         remoteAddr,
                         host,
@@ -253,21 +256,35 @@ export class SOCKS5Handler {
 
                 await Promise.all([clientToRemote, remoteToClient]);
 
-                this.logger.info("SOCKS5 direct connection closed", {
+                this.logger.debug("SOCKS5 direct connection closed", {
                     remoteAddr,
                     host,
                     port
                 });
             }
         } catch (err) {
+            const errMsg = getErrMsg(err);
             this.logger.error("SOCKS5 connection error", {
                 remoteAddr,
                 host,
                 port,
-                error: getErrMsg(err)
+                error: errMsg
             });
+            
+            try {
+                if (errMsg.includes("refused") || errMsg.includes("10061")) {
+                    await sendReply(writer, REP_CONNECTION_REFUSED);
+                } else {
+                    await sendReply(writer, REP_GENERAL_FAILURE);
+                }
+            } catch { /* ignore */ }
+            
+            reader.releaseLock();
+            writer.releaseLock();
         } finally {
-            conn.close();
+            try {
+                conn.close();
+            } catch { /* ignore Bad resource ID */ }
         }
     }
 
@@ -368,6 +385,14 @@ export class SOCKS5Handler {
                 const payload = data.slice(offset + 2);
 
                 const key = `${sender.transport}_${(sender as Deno.NetAddr).hostname ?? "unix"}_${(sender as Deno.NetAddr).port ?? 0}`;
+                // FIX: 限制会话数量，防止内存无限增长
+                if (sessions.size >= MAX_SESSIONS) {
+                    // 删除最旧的会话
+                    const firstKey = sessions.keys().next().value;
+                    if (firstKey !== undefined) {
+                        sessions.delete(firstKey);
+                    }
+                }
                 sessions.set(key, { hostname: targetHost, port: targetPort, lastActivity: Date.now() });
 
                 let shouldProxy: boolean;
@@ -413,36 +438,37 @@ export class SOCKS5Handler {
 }
 
 class PrefixedReader {
-    private prefixConsumed = false;
+    private inner: ReadableStreamDefaultReader<Uint8Array>;
+    private prefixDone = false;
 
     constructor(
-        private stream: ReadableStream<Uint8Array>,
+        stream: ReadableStream<Uint8Array>,
         private prefix: Uint8Array
-    ) { }
+    ) {
+        this.inner = stream.getReader();
+    }
 
     getReader(): ReadableStreamDefaultReader<Uint8Array> {
         const self = this;
-        
         return new ReadableStream<Uint8Array>({
             pull: async (controller) => {
-                if (!self.prefixConsumed) {
-                    self.prefixConsumed = true;
-                    controller.enqueue(self.prefix);
-                    return;
-                }
-
-                const reader = self.stream.getReader();
-                try {
-                    const { value, done } = await reader.read();
-                    if (done) {
-                        controller.close();
-                    } else {
-                        controller.enqueue(value);
+                if (!self.prefixDone) {
+                    self.prefixDone = true;
+                    if (self.prefix.length > 0) {
+                        controller.enqueue(self.prefix);
+                        return;
                     }
-                } finally {
-                    reader.releaseLock();
+                }
+                const { value, done } = await self.inner.read();
+                if (done) {
+                    controller.close();
+                } else {
+                    controller.enqueue(value);
                 }
             },
+            cancel: () => {
+                self.inner.cancel();
+            }
         }).getReader();
     }
 }

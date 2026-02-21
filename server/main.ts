@@ -97,9 +97,9 @@ async function main() {
         })
     ]);
 
-    logger.info("╔════════════════════════════════════════════════════════════╗");
-    logger.info("║          DenoProxy Server Starting                         ║");
-    logger.info("╚════════════════════════════════════════════════════════════╝");
+    logger.info("╔═══════════════════════════════════════╗");
+    logger.info("║       DenoProxy Server Starting       ║");
+    logger.info("╚═══════════════════════════════════════╝");
     logger.info("Server configuration:", {
         hostname: config.hostname,
         port: config.port,
@@ -246,9 +246,10 @@ async function main() {
                     code: e.code,
                     reason: e.reason || undefined,
                     wasClean: e.wasClean,
-                    remainingConnections: connMgr.getStats().active - 1
                 });
-                connMgr.unregister(id);
+                // Don't unregister immediately - transport has a 60s reconnect window.
+                // Transport will fire "timeout" or "close" event when truly done.
+                // Unregister is handled by transport event listeners in register().
                 metrics.gauge("connections_active", connMgr.getStats().active);
             }
         };
@@ -261,7 +262,7 @@ async function main() {
                 error: err.message ?? "Unknown error"
             });
             metrics.increment("connection_errors");
-            if (id) connMgr.unregister(id);
+            // Don't unregister here - transport's onClose will fire and handle reconnect window
         };
 
         socket.addEventListener("open", handleOpen);

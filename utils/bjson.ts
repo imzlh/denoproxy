@@ -26,6 +26,52 @@ enum DataType {
 
 export const Unknown = Symbol("Unknown");
 
+// 复用 TextEncoder/TextDecoder 实例，避免重复创建
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+/**
+ * 动态缓冲区类 - 使用预分配策略减少内存分配
+ */
+class EncodeBuffer {
+    private buffer: Uint8Array;
+    private offset = 0;
+    private static readonly INITIAL_SIZE = 256;
+    private static readonly GROWTH_FACTOR = 1.5;
+
+    constructor(initialSize = EncodeBuffer.INITIAL_SIZE) {
+        this.buffer = new Uint8Array(initialSize);
+    }
+
+    private ensureCapacity(additional: number): void {
+        const required = this.offset + additional;
+        if (required > this.buffer.length) {
+            const newSize = Math.max(
+                required,
+                Math.floor(this.buffer.length * EncodeBuffer.GROWTH_FACTOR)
+            );
+            const newBuffer = new Uint8Array(newSize);
+            newBuffer.set(this.buffer.subarray(0, this.offset));
+            this.buffer = newBuffer;
+        }
+    }
+
+    writeByte(byte: number): void {
+        this.ensureCapacity(1);
+        this.buffer[this.offset++] = byte;
+    }
+
+    writeBytes(data: Uint8Array): void {
+        this.ensureCapacity(data.length);
+        this.buffer.set(data, this.offset);
+        this.offset += data.length;
+    }
+
+    toUint8Array(): Uint8Array {
+        return this.buffer.subarray(0, this.offset);
+    }
+}
+
 /**
  * 编码无符号LEB128
  * @param value 非负bigint
@@ -96,44 +142,44 @@ function zigzagDecode(value: bigint): bigint {
  * @returns Uint8Array
  */
 export function encode(data: unknown): Uint8Array {
-    const bytes: number[] = [];
+    const buffer = new EncodeBuffer();
 
-    function write(data: Uint8Array | number[]) {
-        bytes.push(...(data instanceof Uint8Array ? data : data));
+    function write(data: Uint8Array): void {
+        buffer.writeBytes(data);
     }
 
     function encodeValue(obj: unknown, inArray = false): void {
         if (obj === undefined) {
             if (inArray) {
-                bytes.push(DataType.Undefined);
+                buffer.writeByte(DataType.Undefined);
             }
             return;
         }
 
         if (obj === null) {
-            bytes.push(DataType.Null);
+            buffer.writeByte(DataType.Null);
             return;
         }
 
         const type = typeof obj;
 
         if (type === "boolean") {
-            bytes.push(obj ? DataType.True : DataType.False);
+            buffer.writeByte(obj ? DataType.True : DataType.False);
             return;
         }
 
         if (type === "number") {
             const num = obj as number;
             if (Number.isNaN(num)) {
-                bytes.push(DataType.NaN);
+                buffer.writeByte(DataType.NaN);
             } else if (!Number.isFinite(num)) {
-                bytes.push(num > 0 ? DataType.PosInfinity : DataType.NegInfinity);
+                buffer.writeByte(num > 0 ? DataType.PosInfinity : DataType.NegInfinity);
             } else if (Number.isSafeInteger(num)) {
                 const val = BigInt(num);
-                bytes.push(DataType.Integer);
+                buffer.writeByte(DataType.Integer);
                 write(encodeULEB128(zigzagEncode(val)));
             } else {
-                bytes.push(DataType.Float);
+                buffer.writeByte(DataType.Float);
                 const dv = new DataView(new ArrayBuffer(8));
                 dv.setFloat64(0, num, true); // little-endian
                 write(new Uint8Array(dv.buffer));
@@ -142,25 +188,25 @@ export function encode(data: unknown): Uint8Array {
         }
 
         if (type === "string") {
-            const encoded = new TextEncoder().encode(obj as string);
+            const encoded = textEncoder.encode(obj as string);
             const maxLen = 0xFFFFFFFF;
             if (encoded.length > maxLen) {
                 throw new Error("String too long");
             }
-            bytes.push(DataType.String);
+            buffer.writeByte(DataType.String);
             write(encodeULEB128(BigInt(encoded.length)));
             write(encoded);
             return;
         }
 
         if (type === "bigint") {
-            bytes.push(DataType.Integer);
+            buffer.writeByte(DataType.Integer);
             write(encodeULEB128(zigzagEncode(obj as bigint)));
             return;
         }
 
         if (type === "symbol" || type === "function") {
-            bytes.push(DataType.Unknown);
+            buffer.writeByte(DataType.Unknown);
             return;
         }
 
@@ -170,7 +216,7 @@ export function encode(data: unknown): Uint8Array {
                 if (obj.length > maxLen) {
                     throw new Error("Array too long");
                 }
-                bytes.push(DataType.Array);
+                buffer.writeByte(DataType.Array);
                 write(encodeULEB128(BigInt(obj.length)));
                 for (const item of obj) {
                     encodeValue(item, true);
@@ -184,7 +230,7 @@ export function encode(data: unknown): Uint8Array {
                 if (view.length > maxLen) {
                     throw new Error("Binary data too long");
                 }
-                bytes.push(DataType.Binary);
+                buffer.writeByte(DataType.Binary);
                 write(encodeULEB128(BigInt(view.length)));
                 write(view);
                 return;
@@ -193,10 +239,10 @@ export function encode(data: unknown): Uint8Array {
             // 普通对象，忽略undefined值
             const entries = Object.entries(obj as Record<string, unknown>)
                 .filter(([_, v]) => v !== undefined);
-            bytes.push(DataType.Object);
+            buffer.writeByte(DataType.Object);
             write(encodeULEB128(BigInt(entries.length)));
             for (const [key, value] of entries) {
-                const keyEncoded = new TextEncoder().encode(key);
+                const keyEncoded = textEncoder.encode(key);
                 write(encodeULEB128(BigInt(keyEncoded.length)));
                 write(keyEncoded);
                 encodeValue(value);
@@ -205,11 +251,11 @@ export function encode(data: unknown): Uint8Array {
         }
 
         // 其他未知类型
-        bytes.push(DataType.Unknown);
+        buffer.writeByte(DataType.Unknown);
     }
 
     encodeValue(data);
-    return new Uint8Array(bytes);
+    return buffer.toUint8Array();
 }
 
 /**
@@ -279,7 +325,7 @@ export function decode<T = unknown>(buffer: Uint8Array): T {
             }
             case DataType.String: {
                 const len = Number(readULEB());
-                return new TextDecoder().decode(readBytes(len));
+                return textDecoder.decode(readBytes(len));
             }
             case DataType.Binary: {
                 const len = Number(readULEB());
@@ -298,7 +344,7 @@ export function decode<T = unknown>(buffer: Uint8Array): T {
                 const obj: Record<string, unknown> = {};
                 for (let i = 0; i < len; i++) {
                     const keyLen = Number(readULEB());
-                    const key = new TextDecoder().decode(readBytes(keyLen));
+                    const key = textDecoder.decode(readBytes(keyLen));
                     obj[key] = decodeValue();
                 }
                 return obj;
@@ -328,10 +374,20 @@ export function tryDecode<T = unknown>(buffer: Uint8Array): T | null {
 
 /**
  * 编码为 base64 字符串
+ * 优化：避免使用展开运算符，改用循环处理
  */
 export function encodeToBase64(data: unknown): string {
     const encoded = encode(data);
-    return btoa(String.fromCharCode(...encoded));
+    // 使用循环而非展开运算符，避免大数据栈溢出
+    let binary = '';
+    const len = encoded.length;
+    // 分块处理，每次处理 8192 字节
+    const chunkSize = 8192;
+    for (let i = 0; i < len; i += chunkSize) {
+        const chunk = encoded.subarray(i, Math.min(i + chunkSize, len));
+        binary += String.fromCharCode.apply(null, chunk as unknown as number[]);
+    }
+    return btoa(binary);
 }
 
 /**

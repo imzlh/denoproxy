@@ -13,12 +13,17 @@ type ConnectionInfo = {
 export class ConnectionManager {
     private connections = new Map<string, ConnectionInfo>();
     private cleanupInterval?: number;
+    private readonly cleanupIntervalMs = 30000; // 30秒清理一次
+    private readonly maxConnections: number;
+    private readonly timeout: number;
 
     constructor(
-        private maxConnections: number,
-        private timeout: number,
+        maxConnections: number,
+        timeout: number,
         private logger: Log
     ) {
+        this.maxConnections = maxConnections;
+        this.timeout = timeout;
         this.startCleanup();
     }
 
@@ -49,13 +54,23 @@ export class ConnectionManager {
             reconnectCount: 0
         });
 
-        this.logger.info("Connection registered", {
+        this.logger.debug("Connection registered", {
             connectionId: id,
             total: this.connections.size,
             max: this.maxConnections
         });
 
-        // 监听连接事件
+        // Auto-unregister when transport is fully closed or reconnect times out
+        transport.addEventListener("timeout", () => {
+            this.logger.info("Transport reconnect timed out, unregistering", { connectionId: id });
+            this.unregister(id);
+        });
+        transport.addEventListener("close", () => {
+            if (this.connections.has(id)) {
+                this.logger.debug("Transport closed, unregistering", { connectionId: id });
+                this.connections.delete(id); // don't call unregister (would double-close)
+            }
+        });
         transport.addEventListener("disconnect", () => {
             this.updateActivity(id);
         });
@@ -72,7 +87,7 @@ export class ConnectionManager {
         conn.transport.assign(ws);
         conn.lastActivity = Date.now();
 
-        this.logger.info("Connection reconnected", {
+        this.logger.debug("Connection reconnected", {
             connectionId: id,
             reconnectCount: conn.reconnectCount
         });
@@ -82,7 +97,7 @@ export class ConnectionManager {
         const conn = this.connections.get(id);
         if (!conn) return;
 
-        this.logger.info("Unregistering connection", {
+        this.logger.debug("Unregistering connection", {
             connectionId: id,
             duration: Date.now() - conn.connectedAt,
             reconnectCount: conn.reconnectCount
@@ -141,24 +156,31 @@ export class ConnectionManager {
 
     private startCleanup() {
         this.cleanupInterval = setInterval(() => {
-            const now = Date.now();
-            let cleaned = 0;
-            
-            for (const [id, conn] of this.connections) {
-                if (now - conn.lastActivity > this.timeout) {
-                    this.logger.info("Connection timeout", {
-                        connectionId: id,
-                        idle: Math.floor((now - conn.lastActivity) / 1000) + "s"
-                    });
-                    this.unregister(id);
-                    cleaned++;
-                }
+            this.cleanup();
+        }, this.cleanupIntervalMs);
+    }
+    
+    private cleanup() {
+        const now = Date.now();
+        let cleaned = 0;
+        
+        for (const [id, conn] of this.connections) {
+            if (now - conn.lastActivity > this.timeout) {
+                this.logger.info("Connection timeout", {
+                    connectionId: id,
+                    idle: Math.floor((now - conn.lastActivity) / 1000) + "s"
+                });
+                this.unregister(id);
+                cleaned++;
             }
-
-            if (cleaned > 0) {
-                this.logger.debug("Cleanup complete", { cleaned, remaining: this.connections.size });
-            }
-        }, 60000); // Check every minute
+        }
+        
+        if (cleaned > 0) {
+            this.logger.debug("Connection cleanup complete", { 
+                cleaned, 
+                remaining: this.connections.size 
+            });
+        }
     }
 
     close() {

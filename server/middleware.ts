@@ -1,6 +1,7 @@
 import { Log } from "@cross/log";
 import { ConnectionManager } from "./manager.ts"
 import { getErrMsg } from "../utils/error.ts";
+import { DistributedTokenBucket } from "../utils/rate-limiter.ts";
 
 export class MetricsCollector {
     private counters = new Map<string, number>();
@@ -106,74 +107,50 @@ export class HealthService {
     }
 }
 
+/**
+ * 高性能速率限制器
+ * 使用令牌桶算法，比滑动窗口更高效
+ */
 export class RateLimiter {
-    private requests = new Map<string, number[]>();
+    private tokenBucket: DistributedTokenBucket;
     private cleanupInterval?: number;
 
     constructor(
-        private maxRequests: number,
-        private windowMs: number
-    ) { }
+        maxRequests: number,
+        windowMs: number
+    ) {
+        const refillRate = maxRequests / (windowMs / 1000);
+        this.tokenBucket = new DistributedTokenBucket(
+            maxRequests,
+            refillRate,
+            1000,
+            10000
+        );
+    }
 
     isAllowed(identifier: string): boolean {
-        const now = Date.now();
-        const timestamps = this.requests.get(identifier) || [];
-
-        // Remove old timestamps outside window
-        const validTimestamps = timestamps.filter(ts => now - ts < this.windowMs);
-
-        if (validTimestamps.length >= this.maxRequests) {
-            return false;
-        }
-
-        validTimestamps.push(now);
-        this.requests.set(identifier, validTimestamps);
-
-        return true;
+        return this.tokenBucket.consume(identifier, 1);
     }
 
     getRemainingRequests(identifier: string): number {
-        const now = Date.now();
-        const timestamps = this.requests.get(identifier) || [];
-        const validTimestamps = timestamps.filter(ts => now - ts < this.windowMs);
-        return Math.max(0, this.maxRequests - validTimestamps.length);
-    }
-
-    cleanup() {
-        const now = Date.now();
-        let cleaned = 0;
-        for (const [key, timestamps] of this.requests) {
-            const valid = timestamps.filter(ts => now - ts < this.windowMs);
-            if (valid.length === 0) {
-                this.requests.delete(key);
-                cleaned++;
-            } else {
-                this.requests.set(key, valid);
-            }
-        }
-        return cleaned;
+        return this.tokenBucket.getAvailableTokens(identifier);
     }
 
     startPeriodicCleanup(intervalMs = 60000) {
         this.cleanupInterval = setInterval(() => {
-            const cleaned = this.cleanup();
-            if (cleaned > 0) {
-                console.debug(`Rate limiter cleaned ${cleaned} entries`);
-            }
+            this.tokenBucket.cleanup();
         }, intervalMs);
     }
 
     stopPeriodicCleanup() {
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
+            this.cleanupInterval = undefined;
         }
+        this.tokenBucket.destroy();
     }
 
     getStats() {
-        return {
-            totalEntries: this.requests.size,
-            maxRequests: this.maxRequests,
-            windowMs: this.windowMs,
-        };
+        return this.tokenBucket.getStats();
     }
 }

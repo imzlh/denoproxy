@@ -1,24 +1,27 @@
 import { GeoIPManager } from "./geoip.ts";
 import { Log } from "@cross/log";
 import { getErrMsg } from "../utils/error.ts";
+import { TTLCache } from "../utils/lru-cache.ts";
 
 const DNS_CACHE_TTL = 300000; // 5分钟DNS缓存
 const DNS_TIMEOUT = 5000; // 5秒DNS超时
-
-interface CacheEntry {
-    ips: string[];
-    timestamp: number;
-}
+const MAX_DNS_CACHE_SIZE = 10000; // 最大DNS缓存条目数
 
 export class ProxyDecision {
-    private dnsCache = new Map<string, CacheEntry>();
-    private cacheCleanupInterval?: number;
+    private dnsCache: TTLCache<string, string[]>;
+    private geoip?: GeoIPManager;
+    private logger?: Log;
 
-    constructor(private geoip?: GeoIPManager, private logger?: Log) {
-        // 启动定期清理
-        this.cacheCleanupInterval = setInterval(() => {
-            this.cleanupCache();
-        }, 60000);
+    constructor(geoip?: GeoIPManager, logger?: Log) {
+        this.geoip = geoip;
+        this.logger = logger;
+        
+        // 使用带TTL的LRU缓存，限制大小防止内存泄漏
+        this.dnsCache = new TTLCache<string, string[]>(
+            MAX_DNS_CACHE_SIZE,
+            DNS_CACHE_TTL,
+            true // 自动清理过期条目
+        );
     }
 
     async shouldProxy(host: string): Promise<boolean> {
@@ -32,11 +35,11 @@ export class ProxyDecision {
             return shouldProxy;
         }
 
-        // 检查缓存
+        // 检查缓存（TTLCache自动处理过期）
         const cached = this.dnsCache.get(host);
-        if (cached && Date.now() - cached.timestamp < DNS_CACHE_TTL) {
+        if (cached) {
             this.logger?.debug("Using cached DNS result", { host });
-            return this.checkIPsShouldProxy(cached.ips);
+            return this.checkIPsShouldProxy(cached);
         }
 
         try {
@@ -53,8 +56,8 @@ export class ProxyDecision {
                 return true;
             }
 
-            // 缓存结果
-            this.dnsCache.set(host, { ips, timestamp: Date.now() });
+            // 缓存结果（TTLCache自动处理TTL）
+            this.dnsCache.set(host, ips);
 
             return this.checkIPsShouldProxy(ips);
         } catch (err) {
@@ -86,31 +89,14 @@ export class ProxyDecision {
         return /^\d+\.\d+\.\d+\.\d+$/.test(host) || /^[0-9a-fA-F:]+$/.test(host);
     }
 
-    private cleanupCache() {
-        const now = Date.now();
-        let cleaned = 0;
-        for (const [host, entry] of this.dnsCache) {
-            if (now - entry.timestamp > DNS_CACHE_TTL) {
-                this.dnsCache.delete(host);
-                cleaned++;
-            }
-        }
-        if (cleaned > 0) {
-            this.logger?.debug("Cleaned DNS cache", { cleaned, remaining: this.dnsCache.size });
-        }
-    }
-
     destroy() {
-        if (this.cacheCleanupInterval) {
-            clearInterval(this.cacheCleanupInterval);
-        }
-        this.dnsCache.clear();
+        this.dnsCache.destroy();
     }
 
     getCacheStats() {
         return {
             size: this.dnsCache.size,
-            entries: Array.from(this.dnsCache.keys())
+            maxSize: MAX_DNS_CACHE_SIZE
         };
     }
 }

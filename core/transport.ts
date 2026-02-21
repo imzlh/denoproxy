@@ -5,11 +5,9 @@ import { UDPProxy } from "./protocol/udp.ts";
 import { DNSProxy } from "./protocol/dns.ts";
 import { HTTPProxy } from "./protocol/http-proxy.ts";
 import { CommandHandler } from "./command.ts";
-import { Log } from "@cross/log";
+import type { Log } from "@cross/log";
 import { getErrMsg } from "../utils/error.ts";
-import { TextDecoder } from "node:util";
 
-const HEARTBEAT_INTERVAL = 30000;
 const HEARTBEAT_TIMEOUT = 60000;
 const RECONNECT_TIMEOUT = 60000;
 const MAX_QUEUE_SIZE = 1000;
@@ -27,7 +25,6 @@ export class ProxyTransport extends EventTarget {
     private httpProxy: HTTPProxy;
     private commandHandler: CommandHandler;
     private lastHeartbeat = Date.now();
-    private heartbeatInterval?: number;
     private heartbeatTimeout?: number;
     private reconnectTimeout?: number;
     private ws: WebSocket | null = null;
@@ -40,10 +37,11 @@ export class ProxyTransport extends EventTarget {
         super();
         const sendFn = this.send.bind(this);
         const sendTextFn = this.sendText.bind(this);
-        this.tcpProxy = new TCPProxy(sendFn, logger);
-        this.udpProxy = new UDPProxy(sendFn, logger);
+        const getBuffered = () => this.ws?.bufferedAmount ?? 0;
+        this.tcpProxy = new TCPProxy(sendFn, logger, getBuffered);
+        this.udpProxy = new UDPProxy(sendFn, logger, getBuffered);
         this.dnsProxy = new DNSProxy(sendFn, logger);
-        this.httpProxy = new HTTPProxy(sendFn, logger);
+        this.httpProxy = new HTTPProxy(sendFn, logger, getBuffered);
         this.commandHandler = new CommandHandler(sendTextFn, logger, true);
     }
 
@@ -170,10 +168,6 @@ export class ProxyTransport extends EventTarget {
         
         this.connectionState = 'disconnected';
 
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = undefined;
-        }
         if (this.heartbeatTimeout) {
             clearTimeout(this.heartbeatTimeout);
             this.heartbeatTimeout = undefined;
@@ -201,16 +195,9 @@ export class ProxyTransport extends EventTarget {
         const queue = this.messageQueue;
         this.messageQueue = [];
 
-        if (queue.length > 0) {
-            this.logger.debug("Flushing message queue", {
-                messageCount: queue.length
-            });
-        }
-
         for (const msg of queue) {
             try {
-                const encoded = encodeMessage(msg);
-                this.ws.send(encoded);
+                this.ws.send(encodeMessage(msg));
             } catch (err) {
                 this.logger.error("Failed to send queued message", {
                     error: getErrMsg(err),
@@ -222,36 +209,19 @@ export class ProxyTransport extends EventTarget {
     }
 
     private send(type: MessageType, resourceId: number, data: Uint8Array) {
-        if (this.isClosed) {
-            this.logger.debug("Dropping message (transport closed)", {
-                type,
-                resourceId: resourceId.toString()
-            });
-            return;
-        }
+        if (this.isClosed) return;
 
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            // 检查队列大小限制
             if (this.messageQueue.length >= MAX_QUEUE_SIZE) {
-                this.logger.error("Message queue full, dropping message", {
-                    type,
-                    resourceId: resourceId.toString(),
-                    queueSize: this.messageQueue.length
-                });
+                this.logger.warn("Message queue full, dropping", { type, resourceId });
                 return;
             }
             this.messageQueue.push({ type, resourceId, data });
-            this.logger.debug("Message queued (WebSocket not ready)", {
-                type,
-                resourceId: resourceId.toString(),
-                queueSize: this.messageQueue.length
-            });
             return;
         }
 
         try {
-            const msg = encodeMessage({ type, resourceId, data });
-            this.ws.send(msg);
+            this.ws.send(encodeMessage({ type, resourceId, data }));
         } catch (err) {
             this.logger.error("Failed to send message", {
                 error: getErrMsg(err),
@@ -262,14 +232,9 @@ export class ProxyTransport extends EventTarget {
     }
 
     private startHeartbeat() {
-        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
         if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
-
-        this.heartbeatInterval = setInterval(() => {
-            if (this.isClosed) return;
-            this.send(MessageType.HEARTBEAT, 0, new Uint8Array([Date.now()]));
-        }, HEARTBEAT_INTERVAL);
-
+        // Server side: only reset timeout on received heartbeats.
+        // Client is responsible for initiating heartbeats.
         this.resetHeartbeatTimeout();
     }
 
@@ -293,56 +258,68 @@ export class ProxyTransport extends EventTarget {
 
         const { type, resourceId, data } = msg;
 
-        try {
-            switch (type) {
-                case MessageType.TCP_CONNECT:
-                    this.tcpProxy.handleConnect(resourceId, data);
-                    break;
-                case MessageType.TCP_DATA:
-                    this.tcpProxy.handleData(resourceId, data);
-                    break;
-                case MessageType.TCP_CLOSE:
-                    this.tcpProxy.close(resourceId);
-                    break;
+        // FIX: 异步处理消息，避免阻塞 WebSocket 消息循环
+        const handleAsync = async () => {
+            try {
+                switch (type) {
+                    case MessageType.TCP_CONNECT:
+                        await this.tcpProxy.handleConnect(resourceId, data);
+                        break;
+                    case MessageType.TCP_DATA:
+                        this.tcpProxy.handleData(resourceId, data);
+                        break;
+                    case MessageType.TCP_CLOSE:
+                        this.tcpProxy.close(resourceId);
+                        break;
 
-                case MessageType.UDP_BIND:
-                    this.udpProxy.handleBind(resourceId, data);
-                    break;
-                case MessageType.UDP_DATA:
-                    this.udpProxy.handleData(resourceId, data);
-                    break;
-                case MessageType.UDP_CLOSE:
-                    this.udpProxy.close(resourceId);
-                    break;
+                    case MessageType.UDP_BIND:
+                        this.udpProxy.handleBind(resourceId, data);
+                        break;
+                    case MessageType.UDP_DATA:
+                        await this.udpProxy.handleData(resourceId, data);
+                        break;
+                    case MessageType.UDP_CLOSE:
+                        this.udpProxy.close(resourceId);
+                        break;
 
-                case MessageType.DNS_QUERY:
-                    this.dnsProxy.handleQuery(resourceId, data);
-                    break;
+                    case MessageType.DNS_QUERY:
+                        await this.dnsProxy.handleQuery(resourceId, data);
+                        break;
 
-                case MessageType.HTTP_REQUEST:
-                    this.httpProxy.handleRequest(resourceId, data);
-                    break;
-                case MessageType.HTTP_BODY_CHUNK:
-                    this.httpProxy.handleBodyChunk(resourceId, data);
-                    break;
-                case MessageType.HTTP_BODY_END:
-                    this.httpProxy.handleBodyEnd(resourceId);
-                    break;
+                    case MessageType.HTTP_REQUEST:
+                        await this.httpProxy.handleRequest(resourceId, data);
+                        break;
+                    case MessageType.HTTP_BODY_CHUNK:
+                        this.httpProxy.handleBodyChunk(resourceId, data);
+                        break;
+                    case MessageType.HTTP_BODY_END:
+                        this.httpProxy.handleBodyEnd(resourceId);
+                        break;
 
-                case MessageType.ERROR:
-                    this.logger.error("Received error message", new TextDecoder().decode(data));
-                    break;
+                    case MessageType.ERROR:
+                        this.logger.error("Received error message", new TextDecoder().decode(data));
+                        break;
 
-                default:
-                    this.logger.warn(`Unhandled message type: ${MessageType[type]}`);
+                    default:
+                        this.logger.warn(`Unhandled message type: ${MessageType[type]}`);
+                }
+            } catch (err) {
+                this.logger.error("Error dispatching message", {
+                    error: getErrMsg(err),
+                    type,
+                    resourceId
+                });
             }
-        } catch (err) {
-            this.logger.error("Error dispatching message", {
+        };
+        
+        // 不等待异步操作完成，立即返回
+        handleAsync().catch(err => {
+            this.logger.error("Unhandled error in message handler", {
                 error: getErrMsg(err),
                 type,
                 resourceId
             });
-        }
+        });
     }
 
     close() {
@@ -351,10 +328,6 @@ export class ProxyTransport extends EventTarget {
         this.connectionState = 'disconnected';
         this.messageQueue = [];
 
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = undefined;
-        }
         if (this.heartbeatTimeout) {
             clearTimeout(this.heartbeatTimeout);
             this.heartbeatTimeout = undefined;

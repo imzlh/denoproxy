@@ -2,21 +2,26 @@ import { getErrMsg } from "../../utils/error.ts";
 import { MessageType } from "../protocol.ts";
 import { Log } from "@cross/log";
 
+const DEFAULT_UDP_BUFFER_SIZE = 2048;
 const MAX_UDP_PACKET_SIZE = 65535;
+const MAX_WS_BUFFERED_AMOUNT = 1024 * 1024;
 
 export class UDPProxy {
     private sockets = new Map<number, Deno.DatagramConn>();
     private closingSockets = new Set<number>();
+    private getBufferedAmount: () => number;
 
     constructor(
         private sendMessage: (type: MessageType, id: number, data: Uint8Array) => void,
-        private logger?: Log
-    ) { }
+        private logger?: Log,
+        getBufferedAmount?: () => number
+    ) {
+        this.getBufferedAmount = getBufferedAmount || (() => 0);
+    }
 
     handleBind(resourceId: number, data: Uint8Array) {
         let conn: Deno.DatagramConn | null = null;
         try {
-            // 裸二进制解析：host(字符串长度2字节小端 + 字符串) + port(2字节小端)
             if (data.length < 4) {
                 throw new Error("Invalid bind data: too short");
             }
@@ -45,7 +50,6 @@ export class UDPProxy {
             this.sockets.set(resourceId, conn);
             const addr = conn.addr as Deno.NetAddr;
 
-            // 裸二进制编码响应：hostname(长度2字节小端 + 字符串) + port(2字节小端)
             const responseHost = new TextEncoder().encode(addr.hostname);
             const response = new Uint8Array(2 + responseHost.length + 2);
             let respPos = 0;
@@ -64,7 +68,14 @@ export class UDPProxy {
                 localAddr: `${addr.hostname}:${addr.port}`
             });
 
-            this.receiveLoop(resourceId, conn);
+            // FIX: 启动 receiveLoop 并处理错误
+            this.receiveLoop(resourceId, conn).catch(err => {
+                this.logger?.error("UDP receive loop error", {
+                    resourceId: resourceId.toString(),
+                    error: getErrMsg(err)
+                });
+                this.close(resourceId);
+            });
         } catch (err) {
             this.logger?.error("UDP bind failed", {
                 resourceId: resourceId.toString(),
@@ -91,7 +102,6 @@ export class UDPProxy {
         }
 
         try {
-            // 裸二进制解析：targetHost(长度2字节小端 + 字符串) + targetPort(2字节小端) + payload
             if (data.length < 4) {
                 throw new Error("Invalid UDP data: too short");
             }
@@ -161,52 +171,62 @@ export class UDPProxy {
     }
 
     private async receiveLoop(resourceId: number, conn: Deno.DatagramConn) {
+        const buffer = new Uint8Array(DEFAULT_UDP_BUFFER_SIZE);
+        
         try {
             while (!this.closingSockets.has(resourceId)) {
-                const [data, addr] = await conn.receive();
-
-                if (data.length > MAX_UDP_PACKET_SIZE) {
-                    this.logger?.warn("Received oversized UDP packet", {
-                        resourceId: resourceId.toString(),
-                        size: data.length
-                    });
-                    continue;
+                // 简单的背压控制
+                while (this.getBufferedAmount() > MAX_WS_BUFFERED_AMOUNT) {
+                    await new Promise(r => setTimeout(r, 10));
                 }
 
-                // 裸二进制编码：hostname(长度2字节小端 + 字符串) + port(2字节小端) + data
-                const hostname = (addr as Deno.NetAddr).hostname;
-                const port = (addr as Deno.NetAddr).port;
-                const hostnameBytes = new TextEncoder().encode(hostname);
-
-                const payload = new Uint8Array(2 + hostnameBytes.length + 2 + data.length);
-                let pos = 0;
-
-                // hostname
-                payload[pos++] = hostnameBytes.length & 0xff;
-                payload[pos++] = (hostnameBytes.length >> 8) & 0xff;
-                payload.set(hostnameBytes, pos);
-                pos += hostnameBytes.length;
-
-                // port
-                payload[pos++] = port & 0xff;
-                payload[pos++] = (port >> 8) & 0xff;
-
-                // data
-                payload.set(data, pos);
-
-                this.sendMessage(MessageType.UDP_DATA, resourceId, payload);
-            }
-        } catch (err) {
-            const errorMsg = getErrMsg(err);
-            if (!errorMsg.includes("closed")) {
-                this.logger?.debug("UDP receive loop ended", {
-                    resourceId: resourceId.toString(),
-                    error: errorMsg
-                });
+                try {
+                    const [data, addr] = await conn.receive();
+                    
+                    if (data.length > MAX_UDP_PACKET_SIZE) {
+                        this.logger?.warn("Received oversized UDP packet", {
+                            resourceId: resourceId.toString(),
+                            size: data.length
+                        });
+                        continue;
+                    }
+                    
+                    this.sendUDPData(resourceId, new Uint8Array(data), addr as Deno.NetAddr);
+                } catch (err) {
+                    const errorMsg = getErrMsg(err);
+                    if (errorMsg.includes("closed") || errorMsg.includes("Bad resource")) {
+                        break;
+                    }
+                    this.logger?.debug("UDP receive error", {
+                        resourceId: resourceId.toString(),
+                        error: errorMsg
+                    });
+                }
             }
         } finally {
             this.close(resourceId);
         }
+    }
+
+    private sendUDPData(resourceId: number, data: Uint8Array, addr: Deno.NetAddr) {
+        const hostname = addr.hostname;
+        const port = addr.port;
+        const hostnameBytes = new TextEncoder().encode(hostname);
+
+        const payload = new Uint8Array(2 + hostnameBytes.length + 2 + data.length);
+        let pos = 0;
+
+        payload[pos++] = hostnameBytes.length & 0xff;
+        payload[pos++] = (hostnameBytes.length >> 8) & 0xff;
+        payload.set(hostnameBytes, pos);
+        pos += hostnameBytes.length;
+
+        payload[pos++] = port & 0xff;
+        payload[pos++] = (port >> 8) & 0xff;
+
+        payload.set(data, pos);
+
+        this.sendMessage(MessageType.UDP_DATA, resourceId, payload);
     }
 
     private sendError(resourceId: number, message: string) {
