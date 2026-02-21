@@ -175,11 +175,6 @@ export class UDPProxy {
         
         try {
             while (!this.closingSockets.has(resourceId)) {
-                // 简单的背压控制
-                while (this.getBufferedAmount() > MAX_WS_BUFFERED_AMOUNT) {
-                    await new Promise(r => setTimeout(r, 10));
-                }
-
                 try {
                     const [data, addr] = await conn.receive();
                     

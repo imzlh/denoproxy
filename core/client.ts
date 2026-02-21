@@ -354,13 +354,8 @@ export default class ProxyClient {
     private async sendBody(id: number, body: BodyInit) {
         const stream = body instanceof ReadableStream ? body : new Response(body).body!;
         const reader = stream.getReader();
-
         try {
             while (true) {
-                while (this.ws && this.ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                    await new Promise(r => setTimeout(r, 10));
-                }
-                
                 const { done, value } = await reader.read();
                 if (done) break;
                 this.send(MessageType.HTTP_BODY_CHUNK, id, value);
@@ -683,23 +678,28 @@ export default class ProxyClient {
 }
 
 export class TCPStream {
+    private _writable: WritableStream<Uint8Array>;
+
     constructor(
         private id: number,
         private sendFn: (type: MessageType, id: number, data: Uint8Array) => void,
         public readable: ReadableStream<Uint8Array>
-    ) { }
-
-    get writable(): WritableStream<Uint8Array> {
-        return new WritableStream({
+    ) {
+        // Must be created once; pipeTo locks the stream and re-creating breaks it
+        this._writable = new WritableStream({
             write: (chunk) => {
                 this.sendFn(MessageType.TCP_DATA, this.id, chunk);
             },
             close: () => {
                 this.sendFn(MessageType.TCP_CLOSE, this.id, new Uint8Array(0));
             },
-            abort: (reason) => {
+            abort: () => {
                 this.sendFn(MessageType.TCP_CLOSE, this.id, new Uint8Array(0));
             }
         });
+    }
+
+    get writable(): WritableStream<Uint8Array> {
+        return this._writable;
     }
 }

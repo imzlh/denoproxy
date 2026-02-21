@@ -7,6 +7,22 @@ const DNS_CACHE_TTL = 300000; // 5分钟DNS缓存
 const DNS_TIMEOUT = 5000; // 5秒DNS超时
 const MAX_DNS_CACHE_SIZE = 10000; // 最大DNS缓存条目数
 
+// Private/loopback address ranges that should never go through remote proxy
+const PRIVATE_IP_RANGES = [
+    /^127\./,
+    /^10\./,
+    /^192\.168\./,
+    /^172\.(1[6-9]|2\d|3[01])\./,
+    /^::1$/,
+    /^fc00:/i,
+    /^fd[0-9a-f]{2}:/i,
+    /^localhost$/i,
+];
+
+function isPrivateHost(host: string): boolean {
+    return PRIVATE_IP_RANGES.some(r => r.test(host));
+}
+
 export class ProxyDecision {
     private dnsCache: TTLCache<string, string[]>;
     private geoip?: GeoIPManager;
@@ -25,6 +41,9 @@ export class ProxyDecision {
     }
 
     async shouldProxy(host: string): Promise<boolean> {
+        // Private/local addresses always go direct
+        if (isPrivateHost(host)) return false;
+
         // 如果无 GeoIP，所有流量都走代理
         if (!this.geoip) return true;
 

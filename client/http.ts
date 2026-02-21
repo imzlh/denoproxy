@@ -256,6 +256,7 @@ export class HTTPProxyHandler {
                     
                     try {
                         if (parser.url.startsWith('/')) {
+                            // Direct request: GET /path HTTP/1.1
                             const hostHeader = headers.get("host");
                             if (!hostHeader) { safeReject(new Error("Missing Host header")); return 24; }
                             const [h2, p] = hostHeader.split(':');
@@ -391,6 +392,47 @@ export class HTTPProxyHandler {
         }
     }
 
+    // WebSocket upgrade: replay the HTTP handshake over a raw TCP tunnel,
+    // then pipe the upgraded connection bidirectionally.
+    private async handleWebSocketTunnel(
+        req: HTTPData, conn: Deno.Conn, remoteAddr: string,
+        fullUrl: string, shouldProxy: boolean
+    ): Promise<boolean> {
+        this.logger.debug("WebSocket tunnel", { remoteAddr, url: fullUrl });
+
+        try {
+            // Reconstruct the original GET request to replay to the upstream
+            let reqLine = `${req.method} ${req.url} HTTP/1.1\r\n`;
+            req.headers.forEach((v, k) => { reqLine += `${k}: ${v}\r\n`; });
+            reqLine += '\r\n';
+            const reqBytes = new TextEncoder().encode(reqLine);
+
+            if (shouldProxy) {
+                const stream = await this.client.connectTCP(req.host, req.port, CONNECT_TIMEOUT);
+                // Send the original WS upgrade request upstream
+                const writer = stream.writable.getWriter();
+                await writer.write(reqBytes);
+                writer.releaseLock();
+
+                // Pipe bidirectionally
+                await Promise.all([
+                    conn.readable.pipeTo(stream.writable, { preventClose: true }).catch(() => {}),
+                    stream.readable.pipeTo(conn.writable, { preventClose: true }).catch(() => {}),
+                ]);
+            } else {
+                const remote = await Deno.connect({ hostname: req.host, port: req.port });
+                await remote.write(reqBytes);
+                await Promise.all([
+                    conn.readable.pipeTo(remote.writable, { preventClose: true }).catch(() => {}),
+                    remote.readable.pipeTo(conn.writable, { preventClose: true }).catch(() => {}),
+                ]);
+            }
+        } catch (err) {
+            this.logger.debug("WebSocket tunnel error", { remoteAddr, error: getErrMsg(err) });
+        }
+        return false; // connection consumed, don't keep-alive
+    }
+
     private async handleHTTP(req: HTTPData, conn: Deno.Conn, remoteAddr: string): Promise<boolean> {
         let shouldProxy: boolean;
         try {
@@ -401,6 +443,12 @@ export class HTTPProxyHandler {
         }
 
         const fullUrl = req.url.startsWith("http") ? req.url : `http://${req.host}${req.url}`;
+
+        // WebSocket upgrade: must tunnel as raw TCP, not HTTP fetch
+        const upgrade = req.headers.get('upgrade')?.toLowerCase();
+        if (upgrade === 'websocket') {
+            return await this.handleWebSocketTunnel(req, conn, remoteAddr, fullUrl, shouldProxy);
+        }
 
         this.logger.debug("HTTP request", {
             remoteAddr,

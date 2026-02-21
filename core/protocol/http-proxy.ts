@@ -184,11 +184,6 @@ export class HTTPProxy {
                 const reader = response.body.getReader();
                 try {
                     while (true) {
-                        // Backpressure: if WS buffer is saturated, yield to event loop
-                        if (this.getBufferedAmount() > MAX_WS_BUFFERED) {
-                            await new Promise(r => setTimeout(r, 0));
-                        }
-
                         const { done, value } = await reader.read();
                         if (done) break;
                         
