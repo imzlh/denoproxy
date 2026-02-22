@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DenoProxy Monitor</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- 配置弹窗 -->
+    <div id="configModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>⚙️ 配置服务器</h3>
+                <button class="modal-close" id="closeModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="input-group">
+                    <label for="apiUrl">API 地址</label>
+                    <input type="text" id="apiUrl" placeholder="http://127.0.0.1:8080" value="">
+                    <span class="input-hint">输入 DenoProxy 服务器地址</span>
+                </div>
+                <div class="input-group">
+                    <label for="refreshRate">刷新频率</label>
+                    <select id="refreshRate">
+                        <option value="1000">1 秒</option>
+                        <option value="3000" selected>3 秒</option>
+                        <option value="5000">5 秒</option>
+                        <option value="10000">10 秒</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="cancelConfig">取消</button>
+                <button class="btn btn-primary" id="saveConfig">保存并连接</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div class="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+                    </svg>
+                    <span>DenoProxy</span>
+                </div>
+            </div>
+            
+            <nav class="nav">
+                <a href="#" class="nav-item active" data-view="dashboard">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7" rx="1"/>
+                        <rect x="14" y="3" width="7" height="7" rx="1"/>
+                        <rect x="14" y="14" width="7" height="7" rx="1"/>
+                        <rect x="3" y="14" width="7" height="7" rx="1"/>
+                    </svg>
+                    <span>仪表盘</span>
+                </a>
+                <a href="#" class="nav-item" data-view="connections">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                    </svg>
+                    <span>连接</span>
+                    <span class="badge" id="connBadge">0</span>
+                </a>
+                <a href="#" class="nav-item" data-view="metrics">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M18 20V10M12 20V4M6 20v-6"/>
+                    </svg>
+                    <span>指标</span>
+                </a>
+                <a href="#" class="nav-item" data-view="logs">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="16" y1="13" x2="8" y2="13"/>
+                        <line x1="16" y1="17" x2="8" y2="17"/>
+                        <polyline points="10 9 9 9 8 9"/>
+                    </svg>
+                    <span>日志</span>
+                </a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <button class="btn-config" id="openConfig">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                    </svg>
+                    配置
+                </button>
+            </div>
+        </aside>
+
+        <!-- 主内容区 -->
+        <main class="main">
+            <!-- 顶部栏 -->
+            <header class="header">
+                <div class="header-left">
+                    <h1 id="pageTitle">仪表盘</h1>
+                    <div class="connection-status" id="connStatus">
+                        <span class="status-dot offline"></span>
+                        <span class="status-text">未连接</span>
+                    </div>
+                </div>
+                <div class="header-right">
+                    <span class="last-update" id="lastUpdate">-</span>
+                    <button class="btn-icon" id="refreshBtn" title="刷新">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="23 4 23 10 17 10"/>
+                            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                        </svg>
+                    </button>
+                </div>
+            </header>
+
+            <!-- 内容区域 -->
+            <div class="content">
+                <!-- 仪表盘视图 -->
+                <div class="view active" id="view-dashboard">
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <div class="metric-icon uptime">
+                                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <polyline points="12 6 12 12 16 14"/>
+                                </svg>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-value" id="uptime">-</span>
+                                <span class="metric-label">运行时间</span>
+                            </div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-icon connections">
+                                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                                    <circle cx="9" cy="7" r="4"/>
+                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                                </svg>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-value" id="activeConns">-</span>
+                                <span class="metric-label">活跃连接</span>
+                            </div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-icon memory">
+                                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="4" y="4" width="16" height="16" rx="2"/>
+                                    <rect x="9" y="9" width="6" height="6"/>
+                                    <line x1="9" y1="1" x2="9" y2="4"/>
+                                    <line x1="15" y1="1" x2="15" y2="4"/>
+                                    <line x1="9" y1="20" x2="9" y2="23"/>
+                                    <line x1="15" y1="20" x2="15" y2="23"/>
+                                </svg>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-value" id="memoryUsage">-</span>
+                                <span class="metric-label">内存使用</span>
+                            </div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-icon requests">
+                                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                                    <polyline points="22 4 12 14.01 9 11.01"/>
+                                </svg>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-value" id="reqPerMin">-</span>
+                                <span class="metric-label">请求/分钟</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="dashboard-grid">
+                        <div class="panel">
+                            <div class="panel-header">
+                                <h3>系统信息</h3>
+                            </div>
+                            <div class="panel-body">
+                                <div class="info-list" id="systemInfo">
+                                    <div class="info-item">
+                                        <span class="info-label">Deno 版本</span>
+                                        <span class="info-value">-</span>
+                                    </div>
+                                    <div class="info-item">
+                                        <span class="info-label">主机名</span>
+                                        <span class="info-value">-</span>
+                                    </div>
+                                    <div class="info-item">
+                                        <span class="info-label">CPU 核心</span>
+                                        <span class="info-value">-</span>
+                                    </div>
+                                    <div class="info-item">
+                                        <span class="info-label">平台</span>
+                                        <span class="info-value">-</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="panel">
+                            <div class="panel-header">
+                                <h3>内存详情</h3>
+                            </div>
+                            <div class="panel-body">
+                                <div class="memory-bar">
+                                    <div class="memory-progress" id="memoryProgress"></div>
+                                </div>
+                                <div class="memory-stats" id="memoryStats">
+                                    <div class="memory-stat">
+                                        <span class="memory-label">RSS</span>
+                                        <span class="memory-value">-</span>
+                                    </div>
+                                    <div class="memory-stat">
+                                        <span class="memory-label">Heap Used</span>
+                                        <span class="memory-value">-</span>
+                                    </div>
+                                    <div class="memory-stat">
+                                        <span class="memory-label">Heap Total</span>
+                                        <span class="memory-value">-</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 连接视图 -->
+                <div class="view" id="view-connections">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h3>活跃连接</h3>
+                            <div class="panel-actions">
+                                <span class="text-muted" id="connSummary">共 0 个连接</span>
+                            </div>
+                        </div>
+                        <div class="panel-body">
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>ID</th>
+                                            <th>连接时间</th>
+                                            <th>最后活动</th>
+                                            <th>持续时间</th>
+                                            <th>重连次数</th>
+                                            <th>状态</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="connectionsTable">
+                                        <tr class="empty">
+                                            <td colspan="6">暂无连接</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 指标视图 -->
+                <div class="view" id="view-metrics">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h3>性能指标</h3>
+                            <button class="btn btn-sm btn-secondary" id="resetMetrics">重置指标</button>
+                        </div>
+                        <div class="panel-body">
+                            <div class="metrics-detail" id="metricsDetail">
+                                <div class="metric-section">
+                                    <h4>请求统计</h4>
+                                    <div class="metric-grid" id="requestMetrics"></div>
+                                </div>
+                                <div class="metric-section">
+                                    <h4>计数器</h4>
+                                    <div class="metric-grid" id="counterMetrics"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 日志视图 -->
+                <div class="view" id="view-logs">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h3>实时日志</h3>
+                            <div class="panel-actions">
+                                <select id="logLevel" class="log-level-select">
+                                    <option value="DEBUG">DEBUG</option>
+                                    <option value="INFO" selected>INFO</option>
+                                    <option value="WARN">WARN</option>
+                                    <option value="ERROR">ERROR</option>
+                                </select>
+                                <button class="btn btn-sm btn-secondary" id="clearLogs">清空</button>
+                            </div>
+                        </div>
+                        <div class="panel-body">
+                            <div class="logs-container" id="logsContainer">
+                                <div class="log-entry info">
+                                    <span class="log-time">-</span>
+                                    <span class="log-level">INFO</span>
+                                    <span class="log-msg">选择日志级别开始接收...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div id="toast" class="toast">
+        <span id="toastMsg"></span>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

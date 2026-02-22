@@ -8,6 +8,9 @@ export class MetricsCollector {
     private gauges = new Map<string, number>();
     private histograms = new Map<string, number[]>();
     private startTime = Date.now();
+    private startTimeISO = new Date().toISOString();
+    private requestTimestamps: number[] = [];
+    private readonly maxRequestHistory = 1000;
 
     increment(name: string, value = 1) {
         this.counters.set(name, (this.counters.get(name) || 0) + value);
@@ -21,7 +24,6 @@ export class MetricsCollector {
         const values = this.histograms.get(name) || [];
         values.push(value);
 
-        // Keep only last 1000 values
         if (values.length > 1000) {
             values.shift();
         }
@@ -29,13 +31,41 @@ export class MetricsCollector {
         this.histograms.set(name, values);
     }
 
+    recordRequest() {
+        const now = Date.now();
+        this.requestTimestamps.push(now);
+        if (this.requestTimestamps.length > this.maxRequestHistory) {
+            this.requestTimestamps.shift();
+        }
+    }
+
+    getRequestsPerSecond(): number {
+        if (this.requestTimestamps.length === 0) return 0;
+        const now = Date.now();
+        const oneSecondAgo = now - 1000;
+        const recentRequests = this.requestTimestamps.filter(t => t >= oneSecondAgo);
+        return recentRequests.length;
+    }
+
+    getRequestsPerMinute(): number {
+        if (this.requestTimestamps.length === 0) return 0;
+        const now = Date.now();
+        const oneMinuteAgo = now - 60000;
+        const recentRequests = this.requestTimestamps.filter(t => t >= oneMinuteAgo);
+        return recentRequests.length;
+    }
+
     getSnapshot() {
         const snapshot: Record<string, unknown> = {
             counters: Object.fromEntries(this.counters),
             gauges: Object.fromEntries(this.gauges),
+            requests: {
+                perSecond: this.getRequestsPerSecond(),
+                perMinute: this.getRequestsPerMinute(),
+                total: this.requestTimestamps.length
+            }
         };
 
-        // Calculate histogram percentiles
         const histogramStats: Record<string, unknown> = {};
         for (const [name, values] of this.histograms) {
             if (values.length === 0) continue;
@@ -60,11 +90,17 @@ export class MetricsCollector {
         this.counters.clear();
         this.gauges.clear();
         this.histograms.clear();
+        this.requestTimestamps = [];
         this.startTime = Date.now();
+        this.startTimeISO = new Date().toISOString();
     }
 
     getUptime(): number {
         return Date.now() - this.startTime;
+    }
+
+    getStartTimeISO(): string {
+        return this.startTimeISO;
     }
 }
 
@@ -79,11 +115,14 @@ export class HealthService {
         const connStats = this.connMgr.getStats();
         const metricsSnapshot = this.metrics.getSnapshot();
         const memory = Deno.memoryUsage();
+        const osInfo = this.getOSInfo();
 
         return {
             status: "healthy",
             timestamp: new Date().toISOString(),
-            uptime: Math.floor(this.metrics.getUptime() / 1000),
+            startTime: this.metrics.getStartTimeISO(),
+            uptimeSeconds: Math.floor(this.metrics.getUptime() / 1000),
+            uptime: this.formatUptime(this.metrics.getUptime() / 1000),
             connections: connStats,
             metrics: metricsSnapshot,
             memory: {
@@ -95,25 +134,82 @@ export class HealthService {
                 heapUsedBytes: memory.heapUsed,
                 external: Math.floor(memory.external / 1024 / 1024) + " MB",
                 externalBytes: memory.external,
+                heapUsagePercent: ((memory.heapUsed / memory.heapTotal) * 100).toFixed(2) + "%"
             },
+            system: osInfo,
+            deno: {
+                version: Deno.version.deno,
+                v8: Deno.version.v8,
+                typescript: Deno.version.typescript,
+                build: Deno.build
+            }
         };
     }
 
+    private getOSInfo() {
+        const info: Record<string, unknown> = {};
+        
+        try {
+            if (Deno.hostname) {
+                info.hostname = Deno.hostname();
+            }
+        } catch (_) {}
+
+        try {
+            if ((Deno as any).cpus) {
+                const cpus = (Deno as any).cpus();
+                info.cpus = cpus.length;
+                info.cpuModel = cpus[0]?.model || 'unknown';
+            }
+        } catch (_) {}
+
+        try {
+            if (Deno.loadavg) {
+                info.loadavg = Deno.loadavg();
+            }
+        } catch (_) {}
+
+        try {
+            if (Deno.env) {
+                info.env = {
+                    NODE_ENV: Deno.env.get('NODE_ENV'),
+                    DENO_ENV: Deno.env.get('DENO_ENV')
+                };
+            }
+        } catch (_) {}
+
+        return info;
+    }
+
+    private formatUptime(seconds: number): string {
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+
+        if (d > 0) return `${d}天 ${h}小时 ${m}分`;
+        if (h > 0) return `${h}小时 ${m}分 ${s}秒`;
+        if (m > 0) return `${m}分 ${s}秒`;
+        return `${s}秒`;
+    }
+
     startPeriodicLogging(intervalMs = 60000) {
-        setInterval(() => {
-            const health = this.getHealth();
-            this.logger.info('Health check', health);
-        }, intervalMs);
+        // setInterval(() => {
+        //     const health = this.getHealth();
+        //     this.logger.info('Health check', {
+        //         uptime: health.uptime,
+        //         connections: health.connections.active,
+        //         memory: health.memory.heapUsed,
+        //         requestsPerMin: health.metrics.requests?.perMinute || 0
+        //     });
+        // }, intervalMs);
     }
 }
 
-/**
- * 高性能速率限制器
- * 使用令牌桶算法，比滑动窗口更高效
- */
 export class RateLimiter {
     private tokenBucket: DistributedTokenBucket;
     private cleanupInterval?: number;
+    private requestHistory = new Map<string, number[]>();
 
     constructor(
         maxRequests: number,
@@ -129,6 +225,15 @@ export class RateLimiter {
     }
 
     isAllowed(identifier: string): boolean {
+        const now = Date.now();
+        if (!this.requestHistory.has(identifier)) {
+            this.requestHistory.set(identifier, []);
+        }
+        const history = this.requestHistory.get(identifier)!;
+        history.push(now);
+        if (history.length > 100) {
+            history.shift();
+        }
         return this.tokenBucket.consume(identifier, 1);
     }
 
@@ -136,9 +241,19 @@ export class RateLimiter {
         return this.tokenBucket.getAvailableTokens(identifier);
     }
 
+    getRequestRate(identifier: string, windowMs = 60000): number {
+        const now = Date.now();
+        const history = this.requestHistory.get(identifier) || [];
+        return history.filter(t => now - t < windowMs).length;
+    }
+
     startPeriodicCleanup(intervalMs = 60000) {
         this.cleanupInterval = setInterval(() => {
             this.tokenBucket.cleanup();
+            const now = Date.now();
+            for (const [id, history] of this.requestHistory) {
+                this.requestHistory.set(id, history.filter(t => now - t < 3600000));
+            }
         }, intervalMs);
     }
 
@@ -151,6 +266,12 @@ export class RateLimiter {
     }
 
     getStats() {
-        return this.tokenBucket.getStats();
+        const bucketStats = this.tokenBucket.getStats();
+        return {
+            ...bucketStats,
+            trackedIdentifiers: this.requestHistory.size,
+            totalRequests: Array.from(this.requestHistory.values())
+                .reduce((sum, arr) => sum + arr.length, 0)
+        };
     }
 }

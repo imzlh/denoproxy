@@ -37,11 +37,10 @@ export class ProxyTransport extends EventTarget {
         super();
         const sendFn = this.send.bind(this);
         const sendTextFn = this.sendText.bind(this);
-        const getBuffered = () => this.ws?.bufferedAmount ?? 0;
-        this.tcpProxy = new TCPProxy(sendFn, logger, getBuffered);
-        this.udpProxy = new UDPProxy(sendFn, logger, getBuffered);
+        this.tcpProxy = new TCPProxy(sendFn, logger);
+        this.udpProxy = new UDPProxy(sendFn, logger);
         this.dnsProxy = new DNSProxy(sendFn, logger);
-        this.httpProxy = new HTTPProxy(sendFn, logger, getBuffered);
+        this.httpProxy = new HTTPProxy(sendFn, logger);
         this.commandHandler = new CommandHandler(sendTextFn, logger, true);
     }
 

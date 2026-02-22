@@ -120,16 +120,23 @@ export class TCPProxy {
     }
 
     private async pipeToWebSocket(resourceId: number, conn: Deno.TcpConn, host: string, port: number) {
-        const buffer = new Uint8Array(65536);
+        const buffer = new Uint8Array(65536); // 64KB read buffer
         
         try {
             while (!this.closingConnections.has(resourceId)) {
                 if (!this.connections.has(resourceId)) break;
+
+                // Backpressure: wait if WS buffer is saturated
+                if (this.getBufferedAmount() > MAX_WS_BUFFERED_AMOUNT) {
+                    await new Promise(r => setTimeout(r, 5));
+                    continue;
+                }
                 
                 const n = await conn.read(buffer);
                 if (n === null) break;
                 if (n === 0) continue;
                 
+                // Use subarray (no allocation) for small reads, slice only for large
                 this.sendMessage(MessageType.TCP_DATA, resourceId,
                     n === buffer.length ? buffer.slice() : buffer.subarray(0, n));
             }
