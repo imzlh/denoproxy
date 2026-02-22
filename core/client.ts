@@ -24,6 +24,7 @@ type PendingHandler = {
     reject: (err: Error) => void;
     stream?: ReadableStreamDefaultController<Uint8Array>;
     createdAt: number;
+    requestType?: MessageType;
 };
 
 export default class ProxyClient {
@@ -312,7 +313,8 @@ export default class ProxyClient {
         this.pending.set(id, {
             resolve: () => { },
             reject: () => { },
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            requestType: MessageType.TCP_CONNECT
         });
 
         return new ReadableStream({
@@ -323,25 +325,33 @@ export default class ProxyClient {
                 }
             },
             cancel: () => {
-                // 流被取消时清理
                 this.pending.delete(id);
                 this.send(MessageType.TCP_CLOSE, id, new Uint8Array(0));
             }
         });
     }
 
-    /**
-     * 清理超时的pending请求
-     */
     private cleanupPendingRequests() {
         const now = Date.now();
-        const maxAge = 120000; // 2分钟
+        const maxAge = 120000;
         let cleaned = 0;
 
         for (const [id, handler] of this.pending) {
             if (now - handler.createdAt > maxAge) {
                 handler.reject(new Error("Request timeout (cleanup)"));
                 this.pending.delete(id);
+                
+                switch (handler.requestType) {
+                    case MessageType.TCP_CONNECT:
+                        this.send(MessageType.TCP_CLOSE, id, new Uint8Array(0));
+                        break;
+                    case MessageType.UDP_BIND:
+                        this.send(MessageType.UDP_CLOSE, id, new Uint8Array(0));
+                        break;
+                    case MessageType.HTTP_REQUEST:
+                        this.send(MessageType.HTTP_BODY_END, id, new Uint8Array(0));
+                        break;
+                }
                 cleaned++;
             }
         }
@@ -370,11 +380,10 @@ export default class ProxyClient {
         return new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
                 this.pending.delete(id);
+                this.send(MessageType.HTTP_BODY_END, id, new Uint8Array(0));
                 reject(new Error(`HTTP request timeout after ${timeout}ms`));
             }, timeout);
 
-            // We pre-create the body stream and capture its controller synchronously
-            // so it's ready before the first HTTP_BODY_CHUNK arrives.
             let bodyCtrl: ReadableStreamDefaultController<Uint8Array>;
             const bodyStream = new ReadableStream<Uint8Array>({
                 start: (ctrl) => { bodyCtrl = ctrl; }
@@ -385,8 +394,6 @@ export default class ProxyClient {
                     clearTimeout(timeoutId);
                     try {
                         const resp = decode<HTTPResponse>(data);
-                        // Reuse the same pending entry; just upgrade resolve/reject to no-ops
-                        // and wire the already-created stream controller.
                         const entry = this.pending.get(id)!;
                         entry.resolve = () => {};
                         entry.reject = () => {};
@@ -404,12 +411,12 @@ export default class ProxyClient {
                 },
                 reject: (err) => {
                     clearTimeout(timeoutId);
-                    // close bodyStream on reject too
                     try { bodyCtrl?.error(err); } catch { /* ignore */ }
                     reject(err);
                 },
                 stream: undefined as unknown as ReadableStreamDefaultController<Uint8Array>,
-                createdAt: Date.now()
+                createdAt: Date.now(),
+                requestType: MessageType.HTTP_REQUEST
             });
         });
     }
@@ -441,23 +448,25 @@ export default class ProxyClient {
 
         const handler = this.pending.get(msg.resourceId);
         if (!handler) {
-            this.logger.warn(`No handler for message ${msg.type}, id=${msg.resourceId}`);
-            // close connection
             switch (msg.type) {
-                case MessageType.TCP_CONNECT:
-                case MessageType.TCP_CONNECT_ACK:
                 case MessageType.TCP_DATA:
-                    this.send(MessageType.TCP_CLOSE, msg.resourceId, new Uint8Array(0));
-                break;
-                case MessageType.UDP_BIND:
-                case MessageType.UDP_BIND_ACK:
                 case MessageType.UDP_DATA:
-                case MessageType.UDP_CLOSE:
-                    this.send(MessageType.UDP_CLOSE, msg.resourceId, new Uint8Array(0));
-                break;
                 case MessageType.HTTP_BODY_CHUNK:
-                    this.send(MessageType.HTTP_BODY_END, msg.resourceId, new Uint8Array(0));
-                break;
+                    this.logger.debug(`Received data for closed connection, type=${msg.type}, id=${msg.resourceId}`);
+                    if (msg.type === MessageType.TCP_DATA) {
+                        this.send(MessageType.TCP_CLOSE, msg.resourceId, new Uint8Array(0));
+                    } else if (msg.type === MessageType.UDP_DATA) {
+                        this.send(MessageType.UDP_CLOSE, msg.resourceId, new Uint8Array(0));
+                    } else {
+                        this.send(MessageType.HTTP_BODY_END, msg.resourceId, new Uint8Array(0));
+                    }
+                    break;
+                case MessageType.TCP_CLOSE:
+                case MessageType.UDP_CLOSE:
+                case MessageType.HTTP_BODY_END:
+                    break;
+                default:
+                    this.logger.warn(`No handler for message ${msg.type}, id=${msg.resourceId}`);
             }
             return;
         }
@@ -545,6 +554,18 @@ export default class ProxyClient {
         return new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
                 this.pending.delete(id);
+                switch (type) {
+                    case MessageType.TCP_CONNECT:
+                        this.send(MessageType.TCP_CLOSE, id, new Uint8Array(0));
+                        break;
+                    case MessageType.UDP_BIND:
+                        this.send(MessageType.UDP_CLOSE, id, new Uint8Array(0));
+                        break;
+                    case MessageType.DNS_QUERY:
+                    case MessageType.HTTP_REQUEST:
+                        this.send(MessageType.ERROR, id, new Uint8Array(0));
+                        break;
+                }
                 reject(new Error(`Request timeout after ${timeout}ms`));
             }, timeout);
 
@@ -556,7 +577,8 @@ export default class ProxyClient {
                 this.pending.set(id, {
                     resolve: (data) => { clearTimeout(timeoutId); resolve(data); },
                     reject: (err) => { clearTimeout(timeoutId); reject(err); },
-                    createdAt: Date.now()
+                    createdAt: Date.now(),
+                    requestType: type
                 });
             }
             this.send(type, id, data);

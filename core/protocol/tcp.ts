@@ -74,7 +74,7 @@ export class TCPProxy {
     handleData(resourceId: number, data: Uint8Array) {
         const conn = this.connections.get(resourceId);
         if (!conn) {
-            this.logger?.warn("TCP data for unknown connection", {
+            this.logger?.debug("TCP data for unknown connection (likely closed)", {
                 resourceId: resourceId.toString(),
                 dataSize: data.length
             });

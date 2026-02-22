@@ -91,7 +91,7 @@ export class UDPProxy {
     async handleData(resourceId: number, data: Uint8Array) {
         const conn = this.sockets.get(resourceId);
         if (!conn) {
-            this.logger?.warn("UDP data for unknown socket", {
+            this.logger?.debug("UDP data for unknown socket (likely closed)", {
                 resourceId: resourceId.toString()
             });
             return;

@@ -482,19 +482,19 @@ async function main() {
         });
 
         if (url.pathname !== config.connectPath) {
-            if (url.pathname == '/log') {
-                // 后门：打印配置
-                console.log({
-                    hostname: config.hostname,
-                    port: config.port,
-                    maxConnections: config.maxConnections,
-                    connectionTimeout: config.connectionTimeout + "ms",
-                    logLevel: config.logLevel,
-                    tls: (config.tlsCert && config.tlsKey) ? "enabled" : "disabled",
-                    wsPrefix: config.connectPath,
-                    webui: config.webui
-                });
-            }
+            // if (url.pathname == '/log') {
+            //     // 后门：打印配置
+            //     console.log({
+            //         hostname: config.hostname,
+            //         port: config.port,
+            //         maxConnections: config.maxConnections,
+            //         connectionTimeout: config.connectionTimeout + "ms",
+            //         logLevel: config.logLevel,
+            //         tls: (config.tlsCert && config.tlsKey) ? "enabled" : "disabled",
+            //         wsPrefix: config.connectPath,
+            //         webui: config.webui
+            //     });
+            // }
             return config.webui ? await serveDir(req, {
                 fsRoot: config.webui,
                 showIndex: true

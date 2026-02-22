@@ -100,7 +100,7 @@ export class HTTPProxy {
     handleBodyChunk(resourceId: number, data: Uint8Array) {
         const controller = this.bodyControllers.get(resourceId);
         if (!controller) {
-            this.logger?.warn("HTTP body chunk for unknown request", {
+            this.logger?.debug("HTTP body chunk for unknown request (likely closed)", {
                 resourceId: resourceId.toString()
             });
             return;

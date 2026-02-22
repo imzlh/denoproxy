@@ -15,6 +15,7 @@ export default async function main() {
     const logger = new Log();
     const args = parseArgs(Deno.args, {
         string: ["remote", "mmdb", "hostname"],
+        boolean: ['help'],
         default: {
             remote: envString("CONN_PATH", "ws://localhost:8080"),
             port: envNumber("MIXED_PORT", 7890),
@@ -22,6 +23,18 @@ export default async function main() {
             mmdb: envString("MMDB", "./Country.mmdb"),
         },
     });
+
+    if (args.help) {
+        console.log(`Usage: deno run --allow-net --allow-read --allow-env main.ts [options]
+
+Options:
+  --remote <path>  WebSocket server path (default: ${args.remote})
+  --mmdb <path>    GeoIP database path (default: ${args.mmdb})
+  --hostname <host> Local hostname (default: ${args.hostname})
+  --port <port>    Local port (default: ${args.port})
+  --help           Show this help message`);
+        return;
+    }
 
     logger.info("╔════════════════════════════════════════════════════════════╗");
     logger.info("║          DenoProxy Client Starting                         ║");
